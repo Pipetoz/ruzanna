@@ -1,1010 +1,943 @@
-print("=" * 80)
-print("🧠 ОБУЧЕНИЕ ПСИХОЛОГИЧЕСКОГО БОТА - ПРОДВИНУТАЯ ВЕРСИЯ")
-print("=" * 80)
+#!/usr/bin/env python3
+"""
+RUZANNA - Основной модуль обучения психологического ИИ
+Интеграция с конфигурационной системой
+"""
 
-# ДОБАВЬТЕ ВЫБОР РЕЖИМА
-print("\n🔧 Выберите режим вывода:")
-print("1. 🚀 Быстрый (только LR, Loss, прогресс)")
-print("2. 🐛 Отладочный (все детали)")
-print("3. 📊 Профессиональный (метрики + графики)")
-debug_mode = input("Выберите (1-3, по умолчанию 1): ").strip() or "1"
-DEBUG_MODE = int(debug_mode)
-
-
-import time
-import torch
-from pathlib import Path
-from transformers import GPTNeoForCausalLM, GPT2Tokenizer, BitsAndBytesConfig
-import bitsandbytes as bnb
-from datetime import datetime
 import os
 import sys
-import time
-import math
 import json
-import numpy as np
+import time
+import argparse
+import warnings
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+from path_manager import PathManager
 
-print("=" * 80)
-print("🧠 ОБУЧЕНИЕ ПСИХОЛОГИЧЕСКОГО БОТА - ПРОДВИНУТАЯ ВЕРСИЯ")
-print("   С АДАПТИВНЫМИ НАСТРОЙКАМИ И МЕТРИКАМИ")
-print("=" * 80)
+# ============================================================================
+# НАСТРОЙКА ПУТЕЙ И ИМПОРТОВ
+# ============================================================================
 
-# ================= ПРАВИЛЬНЫЕ ПАРАМЕТРЫ =================
-BATCH_SIZE = 3 
-MAX_LENGTH = 729
-GRADIENT_ACCUMULATION = 9
-LEARNING_RATE = 2e-4
-print("Введи количество эпох...")
-EPOCHS = int(input())
-WARMUP_RATIO = 0.9
+# Добавляем пути для импорта
+current_dir = Path(__file__).parent
+sys.path.insert(0, str(current_dir / "core"))
+sys.path.insert(0, str(current_dir / "data"))
 
-print(f"\n🎯 ПАРАМЕТРЫ ОБУЧЕНИЯ:")
-print(f"   • Batch size: {BATCH_SIZE}")
-print(f"   • Max length: {MAX_LENGTH}")
-print(f"   • Gradient accumulation: {GRADIENT_ACCUMULATION}")
-print(f"   • Learning rate: {LEARNING_RATE:.1e}")
-print(f"   • Epochs: {EPOCHS}")
-print(f"   • Warmup: {WARMUP_RATIO*100}%")
+# Подавление предупреждений
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", message="torch.utils.checkpoint")
 
-# ================= КОНТЕКСТНЫЕ МЕНЕДЖЕРЫ ДЛЯ РЕЖИМОВ =================
-
-class TrainingMode:
-	"""Контекстный менеджер для режима обучения"""
-	def __init__(self, model):
-		self.model = model
-		self.original_cache = None
-		self.original_training = None
-	
-	def __enter__(self):
-		self.original_cache = self.model.config.use_cache
-		self.original_training = self.model.training
-		self.model.config.use_cache = False  # ⛔ Выключаем кэш
-		self.model.gradient_checkpointing_enable()  # ✅ Включаем checkpointing
-		self.model.train()  # ✅ Режим обучения
-		return self
-	
-	def __exit__(self, exc_type, exc_val, exc_tb):
-		self.model.config.use_cache = self.original_cache
-		if not self.original_training:
-			self.model.eval()
-
-class ValidationMode:
-	"""Контекстный менеджер для режима валидации (только loss)"""
-	def __init__(self, model):
-		self.model = model
-		self.original_cache = None
-		self.original_training = None
-		self.original_gradient_checkpointing = None
-	
-	def __enter__(self):
-		self.original_cache = self.model.config.use_cache
-		self.original_training = self.model.training
-		self.original_gradient_checkpointing = self.model.is_gradient_checkpointing
-		
-		self.model.config.use_cache = False  # ⛔ Кэш не нужен
-		if self.model.is_gradient_checkpointing:  # ⛔ Выключаем checkpointing если включен
-			try:
-				self.model.gradient_checkpointing_disable()
-			except:
-				self.model.gradient_checkpointing = False
-		self.model.eval()  # ✅ Режим оценки
-		return self
-	
-	def __exit__(self, exc_type, exc_val, exc_tb):
-		self.model.config.use_cache = self.original_cache
-		if self.original_gradient_checkpointing and not self.model.is_gradient_checkpointing:
-			self.model.gradient_checkpointing_enable()
-		if self.original_training:
-			self.model.train()
-
-class GenerationMode:
-	"""Контекстный менеджер для режима генерации (тесты/инференс)"""
-	def __init__(self, model):
-		self.model = model
-		self.original_cache = None
-		self.original_training = None
-		self.original_gradient_checkpointing = None
-	
-	def __enter__(self):
-		self.original_cache = self.model.config.use_cache
-		self.original_training = self.model.training
-		self.original_gradient_checkpointing = self.model.is_gradient_checkpointing
-		
-		self.model.config.use_cache = True  # ✅ Включаем кэш для скорости
-		if self.model.is_gradient_checkpointing:  # ⛔ Выключаем checkpointing если включен
-			try:
-				self.model.gradient_checkpointing_disable()
-			except:
-				self.model.gradient_checkpointing = False
-		self.model.eval()  # ✅ Режим оценки
-		return self
-	
-	def __exit__(self, exc_type, exc_val, exc_tb):
-		self.model.config.use_cache = self.original_cache
-		if self.original_gradient_checkpointing and not self.model.is_gradient_checkpointing:
-			self.model.gradient_checkpointing_enable()
-		if self.original_training:
-			self.model.train()
-
-# ================= ОПТИМАЛЬНЫЙ ШЕДУЛЕР =================
-
-class OptimalScheduler:
-	"""
-	Оптимальный шедулер для психологической модели
-	Warmup → Cosine Decay → Linear Final
-	"""
-	
-	def __init__(self, optimizer, total_steps, initial_lr, warmup_ratio=0.10):
-		self.optimizer = optimizer
-		self.total_steps = total_steps
-		self.initial_lr = initial_lr
-		self.warmup_steps = int(total_steps * warmup_ratio)
-		self.cosine_steps = int(total_steps * 0.6)
-		self.linear_steps = total_steps - self.warmup_steps - self.cosine_steps
-		self.current_step = 0
-		
-		print(f"\n🎯 ОПТИМАЛЬНЫЙ ШЕДУЛЕР (3 фазы):")
-		print(f"   • Всего шагов: {total_steps}")
-		print(f"   • Warmup: {self.warmup_steps} шагов ({warmup_ratio*100}%)")
-		print(f"   • Cosine decay: {self.cosine_steps} шагов (60%)")
-		print(f"   • Linear final: {self.linear_steps} шагов (остальное)")
-	
-	def step(self):
-		"""Выполняет один шаг шедулера"""
-		self.current_step += 1
-		
-		if self.current_step <= self.warmup_steps:
-			# 1. Warmup: линейный рост
-			lr = self.initial_lr * (self.current_step / self.warmup_steps)
-			phase = "WARMUP"
-			
-		elif self.current_step <= self.warmup_steps + self.cosine_steps:
-			# 2. Cosine decay
-			progress = (self.current_step - self.warmup_steps) / self.cosine_steps
-			lr = self.initial_lr * 0.5 * (1 + math.cos(math.pi * progress))
-			phase = "COSINE"
-			
-		else:
-			# 3. Линейное финальное падение
-			progress = (self.current_step - self.warmup_steps - self.cosine_steps) / self.linear_steps
-			lr = self.initial_lr * 0.1 * (1 - progress * 0.5)
-			phase = "FINAL"
-		
-		# Устанавливаем LR для всех групп параметров
-		for param_group in self.optimizer.param_groups:
-			param_group['lr'] = lr
-		
-		return lr, phase
-# ================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =================
-
-def get_gpu_power():
-    """Получение текущей мощности GPU в ваттах"""
-    try:
-        import pynvml
-        pynvml.nvmlInit()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-        power = pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0  # мВт → Вт
-        pynvml.nvmlShutdown()
-        return f"{power:.0f}"
-    except:
-        return "N/A"
-
-
-# ================= ПРОДВИНУТЫЙ МОНИТОРИНГ =================
-class AdvancedTrainingMonitor:
-	def __init__(self, log_dir, debug_mode=1):
-		self.debug_mode = debug_mode
-		
-		if self.debug_mode >= 2:  # Только в отладочном режиме
-			print(f"\n🔧 [DEBUG] Создание мониторинга...")
-			
-		self.log_dir = Path(log_dir)
-		self.log_dir.mkdir(parents=True, exist_ok=True)
-		
-		self.metrics = {
-			'loss': [], 'lr': [], 'grad_norm': [],
-			'step_time': [], 'memory_usage': [],
-			'perplexity': [], 'empathy_score': []
-		}
-		self.quality_scores = []
-		self.error_log = self.log_dir / "generation_errors.log"
-		
-		# Словари для оценки качества
-		self.empathy_words = [
-			"понимаю", "чувствую", "важно", "ценю", "принимаю", 
-			"спасибо", "слышу", "вижу", "замечаю", "уважаю",
-			"сопереживаю", "разделяю", "осознаю", "признаю"
-		]
-		
-		self.advice_words = [
-			"должен", "надо", "обязан", "рекомендую", 
-			"советую", "следует", "нужно", "стоит"
-		]
-
-	
-
-	def log_batch(self, step, loss, lr, grad_norm=None, memory_gb=None, 
-				  step_time=None, phase="TRAIN", perplexity=None, empathy_score=None):
-		"""Логирование метрик батча"""
-		self.metrics['loss'].append(loss)
-		self.metrics['lr'].append(lr)
-		
-		if grad_norm is not None:
-			self.metrics['grad_norm'].append(grad_norm)
-		if memory_gb is not None:
-			self.metrics['memory_usage'].append(memory_gb)
-		if step_time is not None:
-			self.metrics['step_time'].append(step_time)
-		if perplexity is not None:
-			self.metrics['perplexity'].append(perplexity)
-		if empathy_score is not None:
-			self.metrics['empathy_score'].append(empathy_score)
-		
-		# Сохраняем в CSV (всегда, но вывод только в отладочном режиме)
-		self.save_to_csv(step, loss, lr, memory_gb, phase, perplexity, empathy_score)
-	
-	def save_to_csv(self, step, loss, lr, memory_gb, phase, perplexity=None, empathy_score=None):
-		"""Сохранение лога в CSV - ТИХАЯ ВЕРСИЯ"""
-		csv_file = self.log_dir / "advanced_training_log.csv"
-		
-		if self.debug_mode >= 2:
-			print(f"\n💾 [DEBUG] save_to_csv шаг {step}...")
-		
-		try:
-			write_header = not csv_file.exists()
-			
-			with open(csv_file, 'a', encoding='utf-8', newline='') as f:
-				if write_header:
-					f.write("timestamp,step,loss,lr,memory_gb,phase,perplexity,empathy_score\n")
-				
-				perp_str = f"{perplexity:.2f}" if perplexity is not None else ""
-				empathy_str = f"{empathy_score:.3f}" if empathy_score is not None else ""
-				line = f"{datetime.now().isoformat()},{step},{loss:.6f},{lr:.6f},{memory_gb:.1f},{phase},{perp_str},{empathy_str}\n"
-				f.write(line)
-			
-			if self.debug_mode >= 2:
-				print(f"   ✅ Успешно сохранено")
-			
-		except Exception as e:
-			if self.debug_mode >= 2:
-				print(f"   ❌ ОШИБКА save_to_csv: {e}")
-			
-			# Попробуем записать в другой файл
-			backup = Path.cwd() / f"backup_log_{datetime.now().strftime('%H%M%S')}.csv"
-			try:
-				with open(backup, 'w') as f:
-					f.write(f"Ошибка: {e}\n")
-				print(f"   💾 Создан backup: {backup}")
-			except:
-				pass
-	
-	# Остальные методы остаются без изменений...
-	
-	def log_problematic_response(self, prompt, response, issue):
-		"""Логирование проблемных ответов"""
-		with open(self.error_log, 'a', encoding='utf-8') as f:
-			f.write(f"\n[{datetime.now()}] {issue}\n")
-			f.write(f"Prompt: {prompt}\n")
-			f.write(f"Response: {response}\n")
-			f.write("-"*80 + "\n")
-	
-	def calculate_perplexity(self, model, val_data, batch_size=2):
-		"""Упрощенный расчет perplexity (без ошибки pad_token_id)"""
-		with ValidationMode(model):
-			total_loss = 0.0
-			num_batches = 0
-			
-			with torch.no_grad():
-				for i in range(0, len(val_data), batch_size):
-					if i + batch_size > len(val_data):
-						continue
-					
-					batch = val_data[i:i+batch_size].cuda()
-					outputs = model(batch, labels=batch)
-					
-					if outputs.loss is not None and not torch.isnan(outputs.loss):
-						total_loss += outputs.loss.item()
-						num_batches += 1
-			
-			if num_batches == 0:
-				return float('inf')
-			
-			avg_loss = total_loss / num_batches
-			# Ограничиваем для численной стабильности
-			avg_loss = min(avg_loss, 50)
-			return math.exp(avg_loss)
-	
-	def calculate_empathy_score(self, text):
-		"""Расчет оценки эмпатии по словарю"""
-		if not text:
-			return 0.0
-		
-		text_lower = text.lower()
-		empathy_count = sum(1 for word in self.empathy_words if word in text_lower)
-		
-		# Нормализуем к 0-1, но не слишком строго
-		max_empathy = min(len(self.empathy_words), 5)  # Максимум 5 слов эмпатии в ответе
-		return min(empathy_count / max_empathy, 1.0)
-	
-	def advanced_quality_check(self, model, tokenizer, step, adaptive_temp=True):
-		"""Продвинутая проверка качества с адаптивными настройками"""
-		test_prompts = [
-			"Пациент: Не могу перестать волноваться.",
-			"Пациент: Чувствую себя очень одиноко.",
-			"Пациент: Как найти смысл в жизни?"
-		]
-		
-		scores = []
-		empathy_scores = []
-		responses = []
-		
-		with GenerationMode(model):  # ✅ Используем режим генерации
-			# Адаптивная температура на основе предыдущих результатов
-			if adaptive_temp and self.quality_scores:
-				last_avg_score = self.quality_scores[-1][1] if self.quality_scores else 0.5
-				# Динамическая настройка температуры
-				temperature = max(0.6, 0.9 - (last_avg_score * 0.3))
-			else:
-				temperature = 0.729  # Базовое значение
-			
-			for prompt in test_prompts:
-				response = self.generate_adaptive_response(model, tokenizer, prompt, temperature)
-				score = self.evaluate_response_comprehensive(prompt, response)
-				empathy_score = self.calculate_empathy_score(response)
-				
-				scores.append(score)
-				empathy_scores.append(empathy_score)
-				responses.append(response)
-		
-		avg_score = sum(scores) / len(scores) if scores else 0
-		avg_empathy = sum(empathy_scores) / len(empathy_scores) if empathy_scores else 0
-		
-		self.quality_scores.append((step, avg_score, avg_empathy, temperature))
-		
-		# Сохраняем результаты проверки
-		quality_file = self.log_dir / "advanced_quality_checks.json"
-		quality_data = {
-			'step': step,
-			'timestamp': datetime.now().isoformat(),
-			'avg_score': avg_score,
-			'avg_empathy': avg_empathy,
-			'temperature': temperature,
-			'tests': []
-		}
-		
-		for prompt, response, score, empathy in zip(test_prompts, responses, scores, empathy_scores):
-			quality_data['tests'].append({
-				'prompt': prompt,
-				'response': response,
-				'score': score,
-				'empathy_score': empathy
-			})
-		
-		if quality_file.exists():
-			with open(quality_file, 'r', encoding='utf-8') as f:
-				existing = json.load(f)
-		else:
-			existing = []
-		
-		existing.append(quality_data)
-		
-		with open(quality_file, 'w', encoding='utf-8') as f:
-			json.dump(existing, f, ensure_ascii=False, indent=2)
-		
-		return avg_score, avg_empathy, temperature
-	
-	def generate_adaptive_response(self, model, tokenizer, prompt, temperature=0.729):
-		"""Генерация ответа с адаптивными параметрами"""
-		try:
-			full_prompt = f"{prompt}\n\nПсихолог:"
-			inputs = tokenizer(full_prompt, return_tensors="pt", max_length=512, truncation=True).to(model.device)
-			
-			# Адаптивный top_p на основе температуры
-			top_p = 0.95 if temperature > 0.8 else 0.9
-			
-			with torch.no_grad():
-				outputs = model.generate(
-					**inputs,
-					max_new_tokens=256,
-					min_new_tokens=16,
-					temperature=temperature,
-					do_sample=True,
-					top_p=top_p,
-					top_k=50,
-					pad_token_id=tokenizer.eos_token_id,
-					num_return_sequences=1,
-					repetition_penalty=1.1,
-					length_penalty=0.8
-				)
-			
-			response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-			response = response[len(full_prompt):].strip()
-			
-			# Базовая очистка
-			response = self.clean_response(response)
-			
-			return response
-		except Exception as e:
-			self.log_problematic_response(prompt, str(e), "Ошибка генерации")
-			return ""
-	
-	def clean_response(self, text):
-		"""Очистка ответа"""
-		if not text:
-			return ""
-		
-		# Удаляем артефакты
-		text = text.replace('�', '').replace('\x00', '')
-		
-		# Обрезаем по стоп-фразам
-		stops = ['\nПациент:', '\nПсихолог:', '\n---', '\n===']
-		for stop in stops:
-			if stop in text:
-				text = text.split(stop)[0].strip()
-		
-		# Убираем лишние пробелы
-		text = ' '.join(text.split())
-		
-		return text
-	
-	def evaluate_response_comprehensive(self, prompt, response):
-		"""Комплексная оценка качества ответа"""
-		if not response:
-			return 0.0
-		
-		score = 0.0
-		words = response.split()
-		
-		# 1. Базовая длина (5-80 слов)
-		if 5 <= len(words) <= 80:
-			score += 1.0
-		
-		# 2. Эмпатия (уже считается отдельно, но добавляем бонус)
-		empathy_score = self.calculate_empathy_score(response)
-		score += empathy_score  # Добавляем прямо как часть оценки
-		
-		# 3. Вопросы (важно для психолога)
-		if '?' in response:
-			score += 1.0
-		
-		# 4. Отсутствие советов
-		if not any(word in response.lower() for word in self.advice_words):
-			score += 1.0
-		
-		# 5. Уникальность слов (меньше повторов)
-		if len(words) > 5:
-			unique_words = len(set(words))
-			if unique_words / len(words) > 0.6:
-				score += 1.0
-		
-		# 6. Релевантность запросу
-		prompt_words = set(prompt.lower().split()[:10])
-		response_words = set(response.lower().split())
-		if len(prompt_words.intersection(response_words)) >= 1:
-			score += 1.0
-		
-		# 7. Структура предложений (наличие точек)
-		if '.' in response:
-			score += 0.5
-		
-		# Нормализуем к 0-1 (максимум 7.5 баллов)
-		return min(score / 7.5, 1.0)
-
-# ================= УЛУЧШЕННОЕ СОХРАНЕНИЕ =================
-
-def save_checkpoint(model, tokenizer, optimizer, step, loss, epoch, checkpoint_dir, 
-					is_best=False, scheduler=None, monitor=None):
-	"""
-	Улучшенное сохранение чекпоинта с метриками
-	"""
-	try:
-		checkpoint_dir = Path(checkpoint_dir)
-		checkpoint_dir.mkdir(parents=True, exist_ok=True)
-		
-		print(f"   💾 Сохранение чекпоинта шаг {step}...")
-		
-		# Сохраняем модель
-		model.save_pretrained(str(checkpoint_dir))
-		tokenizer.save_pretrained(str(checkpoint_dir))
-		
-		# Подготовка состояния
-		checkpoint_state = {
-			'step': step,
-			'epoch': epoch,
-			'model_state_dict': model.state_dict(),
-			'optimizer_state_dict': optimizer.state_dict(),
-			'loss': float(loss),
-			'batch_size': BATCH_SIZE,
-			'learning_rate': LEARNING_RATE,
-			'timestamp': datetime.now().isoformat(),
-		}
-		
-		if scheduler:
-			checkpoint_state['scheduler_step'] = scheduler.current_step
-		
-		if monitor and monitor.quality_scores:
-			checkpoint_state['last_quality'] = monitor.quality_scores[-1] if monitor.quality_scores else None
-		
-		torch.save(checkpoint_state, checkpoint_dir / "checkpoint.pt")
-		
-		# Сохраняем информацию о чекпоинте
-		info_file = checkpoint_dir / "checkpoint_info.txt"
-		with open(info_file, 'w', encoding='utf-8') as f:
-			f.write(f"ЧЕКПОИНТ {step}\n")
-			f.write(f"Эпоха: {epoch}\n")
-			f.write(f"Loss: {loss:.6f}\n")
-			f.write(f"Дата: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-			if is_best:
-				f.write(f"\n🏆 СТАТУС: ЛУЧШАЯ МОДЕЛЬ\n")
-		
-		print(f"   ✅ Чекпоинт сохранён")
-		return True
-		
-	except Exception as e:
-		print(f"   ❌ Ошибка при сохранении: {e}")
-		return False
-
-def load_last_checkpoint(checkpoint_dir, model, optimizer=None):
-	"""Загрузка последнего чекпоинта при ошибках"""
-	try:
-		checkpoint_dir = Path(checkpoint_dir)
-		checkpoints = sorted(checkpoint_dir.glob("step_*"), 
-						   key=lambda x: int(x.name.split('_')[1]) if x.name.split('_')[1].isdigit() else 0,
-						   reverse=True)
-		
-		if checkpoints:
-			last_checkpoint = checkpoints[0]
-			checkpoint = torch.load(last_checkpoint / "checkpoint.pt", map_location='cpu')
-			
-			model.load_state_dict(checkpoint['model_state_dict'])
-			if optimizer and 'optimizer_state_dict' in checkpoint:
-				optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-			
-			print(f"✅ Загружен чекпоинт: {last_checkpoint.name}")
-			return checkpoint['step'], checkpoint['loss'], checkpoint['epoch']
-	
-	except Exception as e:
-		print(f"❌ Ошибка загрузки чекпоинта: {e}")
-	
-	return 0, float('inf'), 0
-
-# ================= ПУТИ =================
-BASE_DIR = Path("D:/Ruzanna")
-CHECKPOINTS_DIR = BASE_DIR / "checkpoints_advanced"
-FINAL_MODEL_DIR = BASE_DIR / "final_model_advanced"
-LOGS_DIR = BASE_DIR / "logs_advanced"
-DATA_DIR = Path("C:/Files/processed_epitome")
-
-CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
-FINAL_MODEL_DIR.mkdir(parents=True, exist_ok=True)
-LOGS_DIR.mkdir(parents=True, exist_ok=True)
-
-# Инициализируем продвинутый мониторинг с выбранным режимом
-monitor = AdvancedTrainingMonitor(LOGS_DIR, debug_mode=DEBUG_MODE)
-
-# Только в отладочном режиме показываем проверку
-if DEBUG_MODE >= 2:
-	print(f"\n🔍 ПРОВЕРКА МОНИТОРИНГА:")
-	print(f"   • log_dir: {monitor.log_dir}")
-	
-	# Тестовая запись
-	monitor.save_to_csv(0, 1.0, 1e-4, 5.0, "TEST", 10.0, 0.5)
-
-# ПРОВЕРКА СРАЗУ ПОСЛЕ СОЗДАНИЯ
-print(f"\n🔍 ПРОВЕРКА МОНИТОРИНГА:")
-print(f"   • log_dir: {monitor.log_dir}")
-print(f"   • Существует: {monitor.log_dir.exists()}")
-
-# Тестовая запись через monitor
-monitor.save_to_csv(0, 1.0, 1e-4, 5.0, "TEST", 10.0, 0.5)
-
-# Проверим файл
-csv_file = monitor.log_dir / "advanced_training_log.csv"
-print(f"   • CSV файл создан: {csv_file.exists()}")
-if csv_file.exists():
-	print(f"   • Размер файла: {csv_file.stat().st_size} байт")
-	with open(csv_file, 'r') as f:
-		print(f"   • Содержимое:\n{f.read()}")
-
-# ================= ЗАГРУЗКА ДАННЫХ =================
-print(f"\n📂 Загрузка качественных данных...")
-
-data_path = DATA_DIR / "quality_psych_dialogues_enhanced.json"
-if not data_path.exists():
-	data_path = DATA_DIR / "quality_psych_dialogues.json"
-
-if data_path.exists():
-	with open(data_path, 'r', encoding='utf-8') as f:
-		dialogues = json.load(f)
-	
-	print(f"✅ Загружено {len(dialogues)} диалогов")
-	
-	texts = [dialogue['text'] for dialogue in dialogues]
-	
-else:
-	print(f"❌ Файл не найден: {data_path}")
-	sys.exit(1)
-
-# ================= ТОКЕНИЗАЦИЯ =================
-print(f"\n🔤 Токенизация данных...")
-
-tokenizer = GPT2Tokenizer.from_pretrained("C:/Files/datasets/neo")
-tokenizer.pad_token = tokenizer.eos_token
-
-all_tokens = []
-for text in texts:
-	tokens = tokenizer.encode(
-		text,
-		max_length=MAX_LENGTH,
-		truncation=True,
-		padding='max_length',
-		return_tensors='pt'
-	)
-	all_tokens.append(tokens)
-
-all_tokens = torch.cat(all_tokens, dim=0)
-
-# Разделение
-indices = torch.randperm(len(all_tokens))
-all_tokens = all_tokens[indices]
-
-split_idx = int(0.85 * len(all_tokens))
-train_data = all_tokens[:split_idx]
-val_data = all_tokens[split_idx:]
-
-print(f"   Train: {len(train_data)} примеров")
-print(f"   Validation: {len(val_data)} примеров")
-
-# ================= ЗАГРУЗКА МОДЕЛИ =================
-print(f"\n🧠 Загрузка модели GPT-Neo 2.7B...")
-
-quant_config = BitsAndBytesConfig(
-	load_in_8bit=True,
-	llm_int8_threshold=6.0,
-)
-
-model = GPTNeoForCausalLM.from_pretrained(
-	"C:/Files/datasets/neo",
-	quantization_config=quant_config,
-	device_map="auto",
-	torch_dtype=torch.float16,
-)
-
-print(f"✅ Модель загружена")
-
-# ================= ОПТИМИЗАТОР =================
-print(f"\n⚡ Настройка оптимизатора...")
-
-optimizer = bnb.optim.AdamW8bit(
-	model.parameters(),
-	lr=LEARNING_RATE,
-	betas=(0.9, 0.95),
-	weight_decay=0.01,
-)
-
-# ================= РАСЧЕТ ШАГОВ И ШЕДУЛЕР =================
-
-# НАЙДИТЕ ЭТУ СТРОКУ (~740) И ИСПРАВЬТЕ:
-total_batches = len(train_data) // BATCH_SIZE
-# total_steps = (total_batches // GRADIENT_ACCUMULATION) * EPOCHS  # ❌ СТАРОЕ
-
-# ⬇️ НОВОЕ:
-if GRADIENT_ACCUMULATION > 0:
-	total_steps = max(1, (total_batches + GRADIENT_ACCUMULATION - 1) // GRADIENT_ACCUMULATION * EPOCHS)
-else:
-	total_steps = max(1, total_batches * EPOCHS)
-
-print(f"\n📈 ПЛАН ОБУЧЕНИЯ:")
-print(f"   • Всего шагов: {total_steps}")
-
-scheduler = OptimalScheduler(optimizer, total_steps, LEARNING_RATE, WARMUP_RATIO)
-
-# Настройки для улучшенного раннего стоппинга
-checkpoint_steps = [25, 50, 100, 200, 400, 600, 800]
-best_loss = float('inf')
-best_model_step = 0
-patience = 3
-patience_counter = 0
-previous_val_loss = float('inf')
-min_delta = 0.001  # Минимальное значимое улучшение
-
-# Счетчики для обработки ошибок
-nan_loss_count = 0
-max_nan_losses = 3
-
-# ================= ОБУЧЕНИЕ С АДАПТИВНЫМИ НАСТРОЙКАМИ =================
-print(f"\n🎯 НАЧИНАЮ ОБУЧЕНИЕ С АДАПТИВНЫМИ НАСТРОЙКАМИ...")
-
-with TrainingMode(model):  # ✅ Автоматически настраивает use_cache и gradient_checkpointing
-	print(f"   • Режим: ОБУЧЕНИЕ")
-	print(f"   • use_cache: {model.config.use_cache}")
-	print(f"   • gradient_checkpointing: {model.is_gradient_checkpointing}")
-
-global_step = 0
-start_time = datetime.now()
-
-# Сохраняем начальный чекпоинт
-initial_checkpoint_dir = CHECKPOINTS_DIR / "initial_model"
-save_checkpoint(model, tokenizer, optimizer, 0, float('inf'), 0, initial_checkpoint_dir)
-
-for epoch in range(EPOCHS):
-	print(f"\n{'='*60}")
-	print(f"📚 ЭПОХА {epoch+1}/{EPOCHS}")
-	print(f"{'='*60}")
-	
-	epoch_loss = 0.0
-	batch_count = 0
-	accumulation_count = 0
-	epoch_start_time = time.time()      # ⬅️ ДОБАВЬТЕ
-	last_print_time = time.time()       # ⬅️ ДОБАВЬТЕ
-	
-	# Перемешиваем данные
-	train_indices = torch.randperm(len(train_data))
-	train_data_shuffled = train_data[train_indices]
-	
-	with TrainingMode(model):  # ⬅️ УБЕДИТЕСЬ ЧТО ЕСТЬ ОТСТУП (4 пробела)
-		for batch_idx in range(0, len(train_data_shuffled), BATCH_SIZE):
-			if batch_idx + BATCH_SIZE > len(train_data_shuffled):
-				continue
-				
-			batch_start_time = time.time()
-			batch = train_data_shuffled[batch_idx:batch_idx+BATCH_SIZE].cuda()
-			
-			try:
-				# Forward pass
-				outputs = model(batch, labels=batch)
-				loss = outputs.loss
-				
-				# Проверка на NaN
-				if math.isnan(loss.item()):
-					nan_loss_count += 1
-					print(f"   ⚠️  NaN loss detected ({nan_loss_count}/{max_nan_losses})")
-					
-					if nan_loss_count >= max_nan_losses:
-						print(f"   🔄 Перезагрузка последнего чекпоинта...")
-						global_step, _, _ = load_last_checkpoint(CHECKPOINTS_DIR, model, optimizer)
-						nan_loss_count = 0
-						continue
-					
-					# Пропускаем проблемный батч
-					optimizer.zero_grad()
-					continue
-				
-				loss_value = loss.item()
-				epoch_loss += loss_value
-				batch_count += 1
-				# ================= ВЫВОД ПРОГРЕССА =================
-				current_lr = LEARNING_RATE  # начальное значение
-
-				current_time = time.time()
-				if current_time - last_print_time > 10:  # Каждые 10 секунд
-					progress = (batch_idx / len(train_data_shuffled)) * 100
-					avg_loss_so_far = epoch_loss / (batch_count + 1e-8)
-	
-					# РАСЧЕТ СКОРОСТИ
-					elapsed_since_last_print = current_time - last_print_time
-					batches_since_last_print = (batch_idx // BATCH_SIZE) - last_batch_count if 'last_batch_count' in locals() else 1
-					last_batch_count = batch_idx // BATCH_SIZE
-	
-					dialogs_per_second = batches_since_last_print * BATCH_SIZE / elapsed_since_last_print if elapsed_since_last_print > 0 else 0
-					tokens_per_second = dialogs_per_second * MAX_LENGTH  # Примерная скорость в токенах
-	
-					if DEBUG_MODE == 1:
-					# Цветной вывод (если терминал поддерживает)
-						try:
-						# Определяем цвет для скорости
-							if dialogs_per_second > 0.5:
-								speed_color = "\033[92m"  # зеленый
-								speed_icon = "🚀"
-							elif dialogs_per_second > 0.2:
-								speed_color = "\033[93m"  # желтый
-								speed_icon = "⚡"
-							else:
-								speed_color = "\033[91m"  # красный
-								speed_icon = "🐌"
-			
-							reset_color = "\033[0m"
-			
-							print(f"\r   🔄 {progress:5.1f}% | 📉 {loss_value:7.4f} | 🎛️ {current_lr:.1e} | 🧺 {batch_idx//BATCH_SIZE:4d} | {speed_icon} {speed_color}{dialogs_per_second:5.2f} диал/с{reset_color}", end='', flush=True)
-						except:
-							# Без цветов если не поддерживается
-							print(f"\r   🔄 {progress:5.1f}% | Loss: {loss_value:7.4f} | LR: {current_lr:.2e} | Батч: {batch_idx//BATCH_SIZE:4d} | 🚀 {dialogs_per_second:5.2f} д/с", end='', flush=True)
-	
-					elif DEBUG_MODE >= 2:
-						# Подробный вывод
-						print(f"\n   ⏰ {datetime.now().strftime('%H:%M:%S')}")
-						print(f"   📍 Батч {batch_idx//BATCH_SIZE} ({progress:.1f}%)")
-						print(f"   📉 Loss: {loss_value:.4f} (средн: {avg_loss_so_far:.4f})")
-						print(f"   🚀 Скорость: {dialogs_per_second:.2f} д/с (~{tokens_per_second/1000:.1f}K токенов/сек)")
-						print(f"   💾 GPU память: {torch.cuda.memory_allocated()/1024**3:.1f} GB")
-						print(f"   ⚡ GPU мощность: {get_gpu_power()}W")  # если есть функция получения мощности
-	
-					last_print_time = current_time
-
-				elif DEBUG_MODE == 1:
-					# Быстрое обновление (без расчета скорости)
-					progress = (batch_idx / len(train_data_shuffled)) * 100
-					print(f"\r   🔄 {progress:5.1f}% | Loss: {loss_value:7.4f} | LR: {current_lr:.2e} | Батч: {batch_idx//BATCH_SIZE:4d} | ⏳...", end='', flush=True)
-				# ================= КОНЕЦ ВЫВОДА ПРОГРЕССА =================
-				
-				# Gradient accumulation
-				loss = loss / GRADIENT_ACCUMULATION
-				loss.backward()
-				
-				accumulation_count += 1
-				
-				# Step с gradient accumulation
-				if accumulation_count % GRADIENT_ACCUMULATION == 0:
-					# Gradient clipping
-					grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-					
-					# Оптимизатор
-					optimizer.step()
-					current_lr, phase = scheduler.step()  # ⬅️ ТЕПЕРЬ current_lr обновлен
-					optimizer.zero_grad()
-					
-					global_step += 1
-					step_time = time.time() - batch_start_time
-					
-					# Мониторинг
-					memory_gb = torch.cuda.memory_allocated() / 1024**3
-					monitor.log_batch(global_step, loss_value, current_lr, grad_norm, memory_gb, step_time, phase)
-					
-					# Логирование каждые 10 шагов
-					if global_step % 10 == 0:
-						avg_loss = epoch_loss / batch_count
-						elapsed = (datetime.now() - start_time).seconds / 60
-						
-						print(f"\n   Шаг {global_step} [{phase}]:")
-						print(f"   • Loss: {loss_value:.4f} | Avg: {avg_loss:.4f}")
-						print(f"   • LR: {current_lr:.2e}")
-						print(f"   • Время: {elapsed:.1f} мин")
-					
-					# Продвинутая проверка качества
-					if global_step % 50 == 0:
-						quality_score, empathy_score, current_temp = monitor.advanced_quality_check(
-							model, tokenizer, global_step, adaptive_temp=True
-						)
-						print(f"   • Качество: {quality_score:.2f} | Эмпатия: {empathy_score:.2f} | Temp: {current_temp:.3f}")
-					
-					# Сохранение чекпоинтов
-					if global_step in checkpoint_steps:
-						checkpoint_dir = CHECKPOINTS_DIR / f"step_{global_step}_epoch_{epoch+1}"
-						save_checkpoint(model, tokenizer, optimizer, global_step, 
-									  epoch_loss/batch_count, epoch+1, checkpoint_dir, 
-									  scheduler=scheduler, monitor=monitor)
-				
-			except Exception as e:
-				print(f"\n   ❌ Ошибка в батче: {e}")
-				optimizer.zero_grad()
-				continue
-	
-	# ================= КОНЕЦ ЭПОХИ =================
-	if DEBUG_MODE == 1:
-		print()  # Переводим строку после прогресс-бара
-	
-	# Итоги эпохи
-	avg_epoch_loss = epoch_loss / batch_count if batch_count > 0 else float('inf')
-	print(f"\n✅ ЭПОХА {epoch+1} завершена:")
-	print(f"   • Train Loss: {avg_epoch_loss:.4f}")
-	print(f"   • Шагов: {global_step}")
-	
-	# Расчет perplexity на валидации
-	perplexity = monitor.calculate_perplexity(model, val_data, BATCH_SIZE)
-	print(f"   • Perplexity: {perplexity:.2f}")
-	
-	# Улучшенный ранний стоппинг
-	if previous_val_loss != float('inf'):
-		improvement = previous_val_loss - perplexity
-		
-		if improvement < min_delta:
-			patience_counter += 1
-			print(f"   ⚠️  Малое улучшение perplexity ({improvement:.4f} < {min_delta}). Patience: {patience_counter}/{patience}")
-		else:
-			patience_counter = 0
-			print(f"   ✅ Значительное улучшение perplexity: {improvement:.4f}")
-		
-		if patience_counter >= patience:
-			print(f"\n🚫 РАННЯЯ ОСТАНОВКА: нет значимых улучшений {patience} эпохи подряд")
-			break
-	
-	# Сохранение лучшей модели
-	if perplexity < best_loss:
-		best_loss = perplexity
-		best_model_step = global_step
-		
-		best_dir = CHECKPOINTS_DIR / f"BEST_epoch_{epoch+1}_perplexity_{best_loss:.2f}"
-		save_checkpoint(model, tokenizer, optimizer, global_step, 
-					  best_loss, epoch+1, best_dir, is_best=True, 
-					  scheduler=scheduler, monitor=monitor)
-		print(f"   🏆 НОВАЯ ЛУЧШАЯ МОДЕЛЬ: perplexity={best_loss:.2f}")
-	
-	previous_val_loss = perplexity
-	
-	# Сохраняем чекпоинт эпохи
-	epoch_checkpoint_dir = CHECKPOINTS_DIR / f"epoch_{epoch+1}_final"
-	save_checkpoint(model, tokenizer, optimizer, global_step, avg_epoch_loss, 
-				   epoch+1, epoch_checkpoint_dir, scheduler=scheduler, monitor=monitor)
-
-# ================= СОХРАНЕНИЕ ФИНАЛЬНОЙ МОДЕЛИ =================
-print(f"\n💾 Сохранение финальной модели...")
-
+# Импорт наших модулей
 try:
-	model.save_pretrained(str(FINAL_MODEL_DIR))
-	tokenizer.save_pretrained(str(FINAL_MODEL_DIR))
-	
-	training_info = {
-		'total_steps': global_step,
-		'final_train_loss': avg_epoch_loss,
-		'best_perplexity': best_loss,
-		'best_step': best_model_step,
-		'epochs_completed': epoch + 1,
-		'early_stopped': patience_counter >= patience,
-		'final_perplexity': perplexity,
-		'batch_size': BATCH_SIZE,
-		'learning_rate': LEARNING_RATE,
-		'training_time_minutes': (datetime.now() - start_time).seconds / 60,
-		'completion_time': datetime.now().isoformat(),
-		'adaptive_training': True,
-		'advanced_metrics': True,
-		'gradient_checkpointing': True,
-		'use_cache_strategy': 'adaptive'
-	}
-	
-	with open(FINAL_MODEL_DIR / "training_info.json", 'w', encoding='utf-8') as f:
-		json.dump(training_info, f, ensure_ascii=False, indent=2)
-	
-	print(f"✅ Финальная модель сохранена")
-	
-except Exception as e:
-	print(f"❌ Ошибка сохранения: {e}")
+    from config_loader import ConfigManager
+except ImportError as e:
+    print(f"❌ Ошибка импорта config_loader: {e}")
+    print("Убедитесь, что файл core/config_loader.py существует")
+    sys.exit(1)
 
-# ================= ФИНАЛЬНЫЙ ТЕСТ =================
-print(f"\n🧪 ФИНАЛЬНЫЙ ТЕСТ С АДАПТИВНЫМИ НАСТРОЙКАМИ...")
-with GenerationMode(model):  # ✅ ГЕНЕРАЦИЯ: cache=ON, gc=OFF
-	print(f"   • Режим: ГЕНЕРАЦИЯ")
-	print(f"   • use_cache: {model.config.use_cache}")
-	print(f"   • gradient_checkpointing: {model.is_gradient_checkpointing}")
+# Импорт библиотек для обучения
+try:
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import Dataset, DataLoader
+    import transformers
+    from transformers import (
+        AutoTokenizer,
+        AutoModelForCausalLM,
+        get_linear_schedule_with_warmup,
+        Trainer,
+        TrainingArguments,
+        DataCollatorForLanguageModeling
+    )
+    import numpy as np
+    import pandas as pd
+    from tqdm.auto import tqdm
+    import psutil
+    import GPUtil
+    from colorama import init, Fore, Back, Style
+    init(autoreset=True)
+except ImportError as e:
+    print(f"❌ Ошибка импорта библиотек: {e}")
+    print("Установите необходимые библиотеки:")
+    print("pip install torch transformers numpy pandas tqdm psutil gputil colorama")
+    sys.exit(1)
 
-test_prompts = [
-	"Пациент: Не могу перестать волноваться.",
-	"Пациент: Чувствую себя очень одиноко.",
-	"Пациент: Как найти смысл в жизни?",
-	"Пациент: Всё бессмысленно, не вижу причин продолжать.",
-	"Пациент: Боюсь, что никогда не изменюсь."
-]
+# ============================================================================
+# КЛАСС ДАТАСЕТА
+# ============================================================================
 
-for i, prompt in enumerate(test_prompts):
-	try:
-		# Используем адаптивную температуру на основе качества модели
-		last_quality = monitor.quality_scores[-1][1] if monitor.quality_scores else 0.5
-		adaptive_temp = max(0.6, 0.9 - (last_quality * 0.3))
-		
-		with GenerationMode(model):  # Каждый генерационный вызов в правильном режиме
-			response = monitor.generate_adaptive_response(model, tokenizer, prompt, adaptive_temp)
-			score = monitor.evaluate_response_comprehensive(prompt, response)
-			empathy_score = monitor.calculate_empathy_score(response)
-		
-		print(f"\n{i+1}. 💭 {prompt}")
-		print(f"   🌡️  Temp: {adaptive_temp:.3f}")
-		print(f"   💬 {response[:120]}{'...' if len(response) > 120 else ''}")
-		print(f"   📊 Оценка: {score:.2f} | Эмпатия: {empathy_score:.2f}")
-		
-	except Exception as e:
-		print(f"\n{i+1}. ❌ Ошибка: {e}")
+class PsychDialogueDataset(Dataset):
+    """Датасет психологических диалогов"""
+    
+    def __init__(self, dialogues: List, tokenizer, max_length: int = 512):
+        self.dialogues = dialogues
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        
+    def __len__(self) -> int:
+        return len(self.dialogues)
+    
+    def __getitem__(self, idx: int) -> Dict:
+        dialogue = self.dialogues[idx]
+        
+        # Форматируем диалог
+        formatted = self.format_dialogue(dialogue)
+        
+        # Токенизируем
+        encoding = self.tokenizer(
+            formatted,
+            max_length=self.max_length,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt"
+        )
+        
+        # Для language modeling используем те же токены как labels
+        return {
+            'input_ids': encoding['input_ids'].squeeze(),
+            'attention_mask': encoding['attention_mask'].squeeze(),
+            'labels': encoding['input_ids'].squeeze().clone()  # Для language modeling
+        }
+    
+    def format_dialogue(self, dialogue) -> str:
+        """Форматирует диалог для обучения"""
+        if isinstance(dialogue, dict):
+            if 'text' in dialogue:
+                text = dialogue['text']
+            elif 'dialogue' in dialogue:
+                text = dialogue['dialogue']
+            else:
+                # Пробуем получить первый строковый ключ
+                for key, value in dialogue.items():
+                    if isinstance(value, str) and len(value) > 10:
+                        text = value
+                        break
+                else:
+                    text = str(dialogue)
+        elif isinstance(dialogue, str):
+            text = dialogue
+        else:
+            text = str(dialogue)
+        
+        # Очищаем и добавляем специальные токены
+        text = text.strip()
+        return f"[DIALOGUE_START]\n{text}\n[DIALOGUE_END]"
 
-print(f"\n{'='*80}")
-print("🎉 ОБУЧЕНИЕ ЗАВЕРШЕНО!")
-print(f"{'='*80}")
-print(f"📊 ИТОГОВЫЕ МЕТРИКИ:")
-print(f"   • Шагов: {global_step}")
-print(f"   • Лучший perplexity: {best_loss:.2f}")
-print(f"   • Финальный perplexity: {perplexity:.2f}")
-print(f"   • Ранняя остановка: {'Да' if patience_counter >= patience else 'Нет'}")
-print(f"   • NaN обработок: {nan_loss_count}")
-print(f"   • Время: {(datetime.now() - start_time).seconds/60:.1f} мин")
-print(f"   • Использованные режимы:")
-print(f"      - Обучение: cache=OFF, gradient_checkpointing={model.is_gradient_checkpointing}")
-print(f"      - Валидация: cache=OFF, gradient_checkpointing=OFF")
-print(f"      - Генерация: cache=ON, gradient_checkpointing=OFF")
-print(f"{'='*80}")
+# ============================================================================
+# УТИЛИТЫ ДЛЯ МОНИТОРИНГА
+# ============================================================================
+
+class TrainingMonitor:
+    """Мониторинг процесса обучения"""
+    
+    def __init__(self, log_dir: str = "./logs"):
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(exist_ok=True, parents=True)
+        
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.log_file = self.log_dir / f"training_{timestamp}.log"
+        self.csv_file = self.log_dir / f"metrics_{timestamp}.csv"
+        
+        self.metrics = []
+        self.start_time = time.time()
+        
+    def log_step(self, step: int, loss: float, lr: float, phase: str = "train", **kwargs) -> Dict:
+        """Логирует шаг обучения"""
+        timestamp = datetime.now().isoformat()
+        elapsed = time.time() - self.start_time
+        
+        # Собираем метрики
+        metric = {
+            'timestamp': timestamp,
+            'step': step,
+            'loss': float(loss),
+            'lr': float(lr),
+            'phase': phase,
+            'elapsed_seconds': elapsed,
+            **kwargs
+        }
+        
+        # Мониторинг ресурсов
+        try:
+            metric['cpu_percent'] = psutil.cpu_percent()
+            metric['ram_gb'] = psutil.virtual_memory().used / (1024**3)
+            
+            gpus = GPUtil.getGPUs()
+            if gpus:
+                gpu = gpus[0]
+                metric['gpu_memory_gb'] = gpu.memoryUsed
+                metric['gpu_load'] = gpu.load * 100
+                metric['gpu_temp'] = gpu.temperature
+        except Exception as e:
+            print(f"{Fore.YELLOW}⚠️  Ошибка мониторинга ресурсов: {e}{Style.RESET_ALL}")
+        
+        self.metrics.append(metric)
+        
+        # Записываем в лог
+        with open(self.log_file, 'a', encoding='utf-8') as f:
+            log_line = f"{timestamp} | Step {step:5d} | Loss: {loss:.6f} | LR: {lr:.2e} | Phase: {phase}"
+            if 'speed' in kwargs:
+                log_line += f" | Speed: {kwargs['speed']:.1f} samples/s"
+            f.write(log_line + "\n")
+        
+        # Периодически сохраняем в CSV
+        if step % 10 == 0:
+            self.save_metrics()
+        
+        return metric
+    
+    def save_metrics(self):
+        """Сохраняет метрики в CSV"""
+        if self.metrics:
+            df = pd.DataFrame(self.metrics)
+            df.to_csv(self.csv_file, index=False, encoding='utf-8')
+    
+    def print_status(self, step: int, total_steps: int, loss: float, lr: float, speed: float = None):
+        """Печатает статус обучения"""
+        percent = (step / total_steps) * 100 if total_steps > 0 else 0
+        
+        # Прогресс-бар
+        bar_length = 30
+        filled = int(bar_length * step // total_steps) if total_steps > 0 else 0
+        bar = '█' * filled + '░' * (bar_length - filled)
+        
+        # Цвет в зависимости от прогресса
+        if percent < 33:
+            color = Fore.RED
+        elif percent < 66:
+            color = Fore.YELLOW
+        else:
+            color = Fore.GREEN
+        
+        # Время
+        elapsed = time.time() - self.start_time
+        if step > 0 and speed:
+            remaining = (total_steps - step) / speed if speed > 0 else 0
+            time_str = f"{int(elapsed//60):02d}:{int(elapsed%60):02d} | ETA: {int(remaining//60):02d}:{int(remaining%60):02d}"
+        else:
+            time_str = f"{int(elapsed//60):02d}:{int(elapsed%60):02d}"
+        
+        # Статус
+        status = f"\r{color}{bar}{Style.RESET_ALL} {percent:5.1f}% | "
+        status += f"Step {step:4d}/{total_steps} | "
+        status += f"Loss: {loss:.4f} | "
+        status += f"LR: {lr:.2e} | "
+        status += f"Time: {time_str}"
+        
+        if speed:
+            status += f" | Speed: {speed:.1f} samp/s"
+        
+        print(status, end='', flush=True)
+    
+    def final_report(self):
+        """Финальный отчет"""
+        total_time = time.time() - self.start_time
+        hours = int(total_time // 3600)
+        minutes = int((total_time % 3600) // 60)
+        seconds = int(total_time % 60)
+        
+        print(f"\n{Fore.CYAN}{'='*70}{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}🏁 ОБУЧЕНИЕ ЗАВЕРШЕНО{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}{'='*70}{Style.RESET_ALL}")
+        print(f"Общее время: {hours:02d}:{minutes:02d}:{seconds:02d}")
+        print(f"Логи: {self.log_file}")
+        print(f"Метрики: {self.csv_file}")
+        print(f"{Fore.CYAN}{'='*70}{Style.RESET_ALL}")
+
+# ============================================================================
+# ОСНОВНОЙ КЛАСС ТРЕНЕРА
+# ============================================================================
+
+class PsychAITrainer:
+    """Тренер психологического ИИ"""
+    
+    def __init__(self, config: Dict):
+        self.config = config
+
+         # Инициализируем менеджер путей
+        self.path_manager = PathManager()
+        
+        # Определяем базовую директорию
+        if output_base_dir:
+            self.base_dir = Path(output_base_dir)
+        else:
+            # Берем из конфига или создаем новую
+            base_from_config = config.get('paths', {}).get('base')
+            if base_from_config:
+                self.base_dir = Path(base_from_config)
+            else:
+                # Автоматическое создание эксперимента
+                exp_name = f"psych_train_{datetime.now().strftime('%Y%m%d_%H%M')}"
+                self.base_dir = self.path_manager.create_experiment_dir(
+                    base_path="./experiments",
+                    experiment_name=exp_name
+                )
+        
+        # Создаем сессию
+        self.session_dir = self.path_manager.create_session_dir(self.base_dir)
+        
+        # Обновляем конфиг с путями этой сессии
+        self._update_config_paths()
+        
+        # Теперь настраиваем устройство
+        self.device = self._setup_device()
+        
+        # Инициализируем мониторинг
+        log_dir = self.session_dir / 'logs'
+        self.monitor = TrainingMonitor(str(log_dir))
+        
+        # Компоненты
+        self.tokenizer = None
+        self.model = None
+        self.optimizer = None
+        self.scheduler = None
+        self.train_dataset = None
+        self.val_dataset = None
+        self.train_loader = None
+        self.val_loader = None
+        
+        # Статистика
+        self.stats = {
+            'best_loss': float('inf'),
+            'current_epoch': 0,
+            'total_steps': 0,
+            'checkpoint_paths': []
+        }
+        
+        print(f"{Fore.CYAN}{'='*70}{Style.RESET_ALL}")
+        print(f"{Fore.MAGENTA}🧠 ИНИЦИАЛИЗАЦИЯ ТРЕНЕРА PSYCH AI{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}{'='*70}{Style.RESET_ALL}")
+    
+    def _update_config_paths(self):
+        """Обновляет пути в конфиге на актуальные"""
+        paths = self.path_manager.get_all_paths(self.session_dir)
+        
+        # Обновляем конфиг
+        if 'paths' not in self.config:
+            self.config['paths'] = {}
+        
+        for key, path in paths.items():
+            self.config['paths'][key] = str(path)
+        
+        # Сохраняем конфиг этой сессии
+        config_path = self.session_dir / 'configs' / 'training_config.json'
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(self.config, f, indent=2, ensure_ascii=False)
+
+    def _setup_device(self) -> torch.device:
+        """Настраивает устройство для обучения"""
+        device_config = self.config.get('system', {}).get('device', 'cuda')
+        
+        if device_config == 'cuda' and torch.cuda.is_available():
+            device = torch.device('cuda')
+            gpu_name = torch.cuda.get_device_name(0)
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
+            print(f"{Fore.GREEN}✅ Используется GPU: {gpu_name}{Style.RESET_ALL}")
+            print(f"   Память: {gpu_memory:.1f} GB")
+            print(f"   CUDA версия: {torch.version.cuda}")
+        else:
+            device = torch.device('cpu')
+            print(f"{Fore.YELLOW}⚠️  Используется CPU (CUDA не доступна){Style.RESET_ALL}")
+        
+        return device
+    
+    def load_data(self) -> List:
+        """Загружает данные для обучения"""
+        print(f"\n{Fore.CYAN}📥 ЗАГРУЗКА ДАННЫХ{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}{'-'*40}{Style.RESET_ALL}")
+        
+        data_config = self.config.get('data', {})
+        data_path = data_config.get('path', '')
+        
+        if not data_path:
+            raise ValueError("Путь к данным не указан в конфигурации")
+        
+        data_path = Path(data_path)
+        if not data_path.exists():
+            raise FileNotFoundError(f"Файл данных не найден: {data_path}")
+        
+        # Загружаем данные
+        try:
+            with open(data_path, 'r', encoding='utf-8') as f:
+                dialogues = json.load(f)
+            
+            if not isinstance(dialogues, list):
+                raise ValueError("Данные должны быть списком диалогов")
+            
+            # Ограничиваем количество если нужно
+            max_dialogues = data_config.get('max_dialogues')
+            if max_dialogues and len(dialogues) > max_dialogues:
+                dialogues = dialogues[:max_dialogues]
+                print(f"{Fore.YELLOW}⚠️  Ограничено до {max_dialogues} диалогов{Style.RESET_ALL}")
+            
+            print(f"{Fore.GREEN}✅ Загружено {len(dialogues)} диалогов{Style.RESET_ALL}")
+            print(f"   Путь: {data_path}")
+            print(f"   Размер файла: {data_path.stat().st_size / 1024 / 1024:.1f} MB")
+            
+            # Пример диалога
+            if dialogues:
+                sample = dialogues[0]
+                if isinstance(sample, dict) and 'text' in sample:
+                    preview = sample['text'][:100] + "..." if len(sample['text']) > 100 else sample['text']
+                else:
+                    preview = str(sample)[:100] + "..."
+                print(f"   Пример: {preview}")
+            
+            return dialogues
+            
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Ошибка парсинга JSON: {e}")
+        except Exception as e:
+            raise Exception(f"Ошибка загрузки данных: {e}")
+    
+    def prepare_tokenizer(self):
+        """Подготавливает токенизатор"""
+        print(f"\n{Fore.CYAN}🔤 ПОДГОТОВКА ТОКЕНИЗАТОРА{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}{'-'*40}{Style.RESET_ALL}")
+        
+        model_config = self.config.get('model', {})
+        model_name = model_config.get('name', 'EleutherAI/gpt-neo-2.7B')
+        
+        try:
+            print(f"Загрузка токенизатора: {model_name}...")
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            
+            # Настраиваем специальные токены
+            if not self.tokenizer.pad_token:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+                print(f"{Fore.YELLOW}⚠️  Установлен pad_token = eos_token{Style.RESET_ALL}")
+            
+            # Добавляем наши специальные токены
+            special_tokens = {
+                'additional_special_tokens': ['[DIALOGUE_START]', '[DIALOGUE_END]']
+            }
+            self.tokenizer.add_special_tokens(special_tokens)
+            
+            print(f"{Fore.GREEN}✅ Токенизатор загружен{Style.RESET_ALL}")
+            print(f"   Модель: {model_name}")
+            print(f"   Размер словаря: {len(self.tokenizer):,} токенов")
+            print(f"   Макс. длина: {self.tokenizer.model_max_length}")
+            
+            return self.tokenizer
+            
+        except Exception as e:
+            raise Exception(f"Ошибка загрузки токенизатора: {e}")
+    
+    def prepare_model(self):
+        """Подготавливает модель"""
+        print(f"\n{Fore.CYAN}🤖 ПОДГОТОВКА МОДЕЛИ{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}{'-'*40}{Style.RESET_ALL}")
+        
+        model_config = self.config.get('model', {})
+        model_name = model_config.get('name', 'EleutherAI/gpt-neo-2.7B')
+        
+        try:
+            print(f"Загрузка модели: {model_name}...")
+            
+            # Определяем тип данных
+            precision = self.config.get('system', {}).get('precision', 'fp32')
+            if precision == 'fp16' and self.device.type == 'cuda':
+                torch_dtype = torch.float16
+                print(f"   Используется половинная точность (fp16)")
+            else:
+                torch_dtype = torch.float32
+                print(f"   Используется полная точность (fp32)")
+            
+            # Параметры загрузки
+            load_kwargs = {
+                'torch_dtype': torch_dtype,
+                'device_map': 'auto' if self.device.type == 'cuda' else None,
+            }
+            
+            # Отключаем кэш если используем gradient checkpointing
+            if model_config.get('gradient_checkpointing', True):
+                load_kwargs['use_cache'] = False
+            
+            # Загружаем модель
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                **load_kwargs
+            )
+            
+            # Переносим на устройство если не использовали device_map
+            if 'device_map' not in load_kwargs or not load_kwargs['device_map']:
+                self.model.to(self.device)
+            
+            # Включаем gradient checkpointing если нужно
+            if model_config.get('gradient_checkpointing', True):
+                self.model.gradient_checkpointing_enable()
+                print(f"   Gradient checkpointing: {Fore.GREEN}Включен{Style.RESET_ALL}")
+            
+            # Изменяем размер эмбеддингов для новых токенов
+            if self.tokenizer and len(self.tokenizer) != self.model.config.vocab_size:
+                old_size = self.model.config.vocab_size
+                self.model.resize_token_embeddings(len(self.tokenizer))
+                print(f"   Размер эмбеддингов изменён: {old_size:,} → {len(self.tokenizer):,}")
+            
+            # Считаем параметры
+            total_params = sum(p.numel() for p in self.model.parameters())
+            trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            
+            print(f"{Fore.GREEN}✅ Модель загружена{Style.RESET_ALL}")
+            print(f"   Параметры: {total_params:,} (обучаемых: {trainable_params:,})")
+            print(f"   Слои: {len(list(self.model.parameters()))}")
+            
+            return self.model
+            
+        except Exception as e:
+            raise Exception(f"Ошибка загрузки модели: {e}")
+    
+    def create_datasets(self, dialogues: List):
+        """Создает тренировочный и валидационный датасеты"""
+        print(f"\n{Fore.CYAN}📊 СОЗДАНИЕ ДАТАСЕТОВ{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}{'-'*40}{Style.RESET_ALL}")
+        
+        # Параметры
+        data_config = self.config.get('data', {})
+        tokenization_config = self.config.get('tokenization', {})
+        
+        train_split = data_config.get('train_split', 0.85)
+        val_split = data_config.get('val_split', 0.15)
+        max_length = tokenization_config.get('max_length', 512)
+        
+        # Разделение данных
+        n_total = len(dialogues)
+        n_train = int(n_total * train_split)
+        n_val = int(n_total * val_split)
+        
+        # Проверяем split
+        if n_train + n_val > n_total:
+            n_val = n_total - n_train
+        
+        train_dialogues = dialogues[:n_train]
+        val_dialogues = dialogues[n_train:n_train + n_val]
+        
+        print(f"Всего диалогов: {n_total:,}")
+        print(f"Тренировочных: {n_train:,} ({train_split*100:.0f}%)")
+        print(f"Валидационных: {n_val:,} ({val_split*100:.0f}%)")
+        
+        # Создаем датасеты
+        self.train_dataset = PsychDialogueDataset(
+            train_dialogues, self.tokenizer, max_length
+        )
+        
+        self.val_dataset = PsychDialogueDataset(
+            val_dialogues, self.tokenizer, max_length
+        )
+        
+        print(f"{Fore.GREEN}✅ Датасеты созданы{Style.RESET_ALL}")
+        print(f"   Макс. длина токенов: {max_length}")
+        
+        return self.train_dataset, self.val_dataset
+    
+    def create_dataloaders(self):
+        """Создает DataLoader'ы"""
+        print(f"\n{Fore.CYAN}🔄 СОЗДАНИЕ DATALOADERS{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}{'-'*40}{Style.RESET_ALL}")
+        
+        training_config = self.config.get('training', {})
+        batch_size = training_config.get('batch_size', 3)
+        grad_accumulation = training_config.get('gradient_accumulation', 1)
+        
+        # Создаем DataLoader для тренировки
+        self.train_loader = DataLoader(
+            self.train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=0,  # 0 для избежания проблем с Windows
+            pin_memory=self.device.type == 'cuda'
+        )
+        
+        # Создаем DataLoader для валидации
+        self.val_loader = DataLoader(
+            self.val_dataset,
+            batch_size=max(1, batch_size // 2),  # Меньший batch для валидации
+            shuffle=False,
+            num_workers=0,
+            pin_memory=self.device.type == 'cuda'
+        )
+        
+        # Считаем общее количество шагов
+        epochs = training_config.get('epochs', 3)
+        steps_per_epoch = len(self.train_loader) // grad_accumulation
+        if len(self.train_loader) % grad_accumulation != 0:
+            steps_per_epoch += 1
+        
+        total_steps = steps_per_epoch * epochs
+        self.stats['total_steps'] = total_steps
+        
+        print(f"{Fore.GREEN}✅ DataLoader'ы созданы{Style.RESET_ALL}")
+        print(f"   Batch size: {batch_size}")
+        print(f"   Gradient accumulation: {grad_accumulation}")
+        print(f"   Шагов на эпоху: {steps_per_epoch:,}")
+        print(f"   Всего шагов: {total_steps:,}")
+        print(f"   Batches: train={len(self.train_loader)}, val={len(self.val_loader)}")
+        
+        return self.train_loader, self.val_loader
+    
+    def prepare_optimizer(self):
+        """Подготавливает оптимизатор и шедулер"""
+        print(f"\n{Fore.CYAN}⚡ ПОДГОТОВКА ОПТИМИЗАТОРА{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}{'-'*40}{Style.RESET_ALL}")
+        
+        training_config = self.config.get('training', {})
+        
+        # Параметры оптимизатора
+        lr = training_config.get('learning_rate', 2e-4)
+        weight_decay = training_config.get('weight_decay', 0.01)
+        
+        # Оптимизатор
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=lr,
+            weight_decay=weight_decay,
+            betas=(0.9, 0.999),
+            eps=1e-8
+        )
+        
+        # Шедулер
+        warmup_ratio = training_config.get('warmup_ratio', 0.9)
+        warmup_steps = int(self.stats['total_steps'] * warmup_ratio)
+        
+        self.scheduler = get_linear_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=self.stats['total_steps']
+        )
+        
+        print(f"{Fore.GREEN}✅ Оптимизатор настроен{Style.RESET_ALL}")
+        print(f"   Алгоритм: AdamW")
+        print(f"   Learning rate: {lr:.2e}")
+        print(f"   Weight decay: {weight_decay}")
+        print(f"   Warmup steps: {warmup_steps:,} ({warmup_ratio*100:.0f}%)")
+        
+        return self.optimizer, self.scheduler
+    
+    def save_checkpoint(self, step: int, loss: float, is_best: bool = False):
+        """Сохраняет чекпоинт"""
+        checkpoint_config = self.config.get('checkpoint', {})
+        checkpoint_dir = Path(checkpoint_config.get('dir', './checkpoints'))
+        checkpoint_dir.mkdir(exist_ok=True, parents=True)
+        
+        # Имя чекпоинта
+        if is_best:
+            checkpoint_name = f"best_model_step_{step}_loss_{loss:.4f}"
+        else:
+            checkpoint_name = f"checkpoint_step_{step}_loss_{loss:.4f}"
+        
+        checkpoint_path = checkpoint_dir / checkpoint_name
+        
+        # Сохраняем состояние
+        torch.save({
+            'step': step,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'loss': loss,
+            'config': self.config,
+            'stats': self.stats,
+            'tokenizer_config': self.tokenizer.get_vocab() if self.tokenizer else None,
+        }, checkpoint_path)
+        
+        # Добавляем в список
+        self.stats['checkpoint_paths'].append(str(checkpoint_path))
+        
+        # Ограничиваем количество чекпоинтов
+        save_total_limit = checkpoint_config.get('save_total_limit', 3)
+        if len(self.stats['checkpoint_paths']) > save_total_limit:
+            # Удаляем самый старый
+            oldest = self.stats['checkpoint_paths'].pop(0)
+            try:
+                Path(oldest).unlink()
+            except:
+                pass
+        
+        if is_best:
+            print(f"{Fore.GREEN}💾 Лучший чекпоинт сохранён: {checkpoint_path.name}{Style.RESET_ALL}")
+        else:
+            print(f"{Fore.BLUE}💾 Чекпоинт сохранён: {checkpoint_path.name}{Style.RESET_ALL}")
+        
+        return checkpoint_path
+    
+    def train_epoch(self, epoch: int) -> float:
+        """Обучает одну эпоху"""
+        print(f"\n{Fore.CYAN}{'='*70}{Style.RESET_ALL}")
+        print(f"{Fore.MAGENTA}📚 ЭПОХА {epoch}/{self.config.get('training', {}).get('epochs', 3)}{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}{'='*70}{Style.RESET_ALL}")
+        
+        self.model.train()
+        total_loss = 0
+        total_samples = 0
+        
+        training_config = self.config.get('training', {})
+        grad_accumulation = training_config.get('gradient_accumulation', 1)
+        max_grad_norm = training_config.get('max_grad_norm', 1.0)
+        
+        # Прогресс бар
+        pbar = tqdm(self.train_loader, desc=f"Эпоха {epoch}", 
+                   bar_format="{l_bar}{bar:30}{r_bar}", 
+                   colour="green")
+        
+        start_time = time.time()
+        accumulation_steps = 0
+        
+        for batch_idx, batch in enumerate(pbar):
+            # Переносим batch на устройство
+            input_ids = batch['input_ids'].to(self.device)
+            attention_mask = batch['attention_mask'].to(self.device)
+            labels = batch['labels'].to(self.device)
+            
+            # Forward pass
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels
+            )
+            
+            loss = outputs.loss
+            loss = loss / grad_accumulation  # Нормализуем loss для accumulation
+            
+            # Backward pass
+            loss.backward()
+            
+            # Накопление градиентов
+            accumulation_steps += 1
+            if accumulation_steps % grad_accumulation == 0:
+                # Обрезаем градиенты
+                if max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
+                
+                # Шаг оптимизатора
+                self.optimizer.step()
+                self.scheduler.step()
+                self.optimizer.zero_grad()
+                
+                # Считаем статистику
+                current_step = self.stats['current_epoch'] * len(self.train_loader) + batch_idx
+                current_lr = self.scheduler.get_last_lr()[0]
+                
+                # Мониторинг
+                speed = batch_size / (time.time() - start_time) if batch_idx > 0 else 0
+                start_time = time.time()
+                
+                self.monitor.log_step(
+                    step=current_step,
+                    loss=loss.item() * grad_accumulation,  # Возвращаем оригинальное значение
+                    lr=current_lr,
+                    phase="train",
+                    speed=speed,
+                    epoch=epoch,
+                    batch=batch_idx
+                )
+                
+                # Обновляем progress bar
+                pbar.set_postfix({
+                    'loss': f"{loss.item() * grad_accumulation:.4f}",
+                    'lr': f"{current_lr:.2e}",
+                    'speed': f"{speed:.1f}/s"
+                })
+            
+            total_loss += loss.item() * grad_accumulation * input_ids.size(0)
+            total_samples += input_ids.size(0)
+        
+        # Завершаем оставшиеся градиенты
+        if accumulation_steps % grad_accumulation != 0:
+            self.optimizer.step()
+            self.scheduler.step()
+            self.optimizer.zero_grad()
+        
+        avg_loss = total_loss / total_samples if total_samples > 0 else 0
+        print(f"{Fore.GREEN}✅ Эпоха {epoch} завершена{Style.RESET_ALL}")
+        print(f"   Средний loss: {avg_loss:.4f}")
+        
+        return avg_loss
+    
+    def validate(self) -> float:
+        """Валидация модели"""
+        print(f"\n{Fore.CYAN}🧪 ВАЛИДАЦИЯ{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}{'-'*40}{Style.RESET_ALL}")
+        
+        self.model.eval()
+        total_loss = 0
+        total_samples = 0
+        
+        with torch.no_grad():
+            val_bar = tqdm(self.val_loader, desc="Валидация", 
+                          bar_format="{l_bar}{bar:30}{r_bar}", 
+                          colour="yellow")
+            
+            for batch_idx, batch in enumerate(val_bar):
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
+                labels = batch['labels'].to(self.device)
+                
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels
+                )
+                
+                loss = outputs.loss
+                total_loss += loss.item() * input_ids.size(0)
+                total_samples += input_ids.size(0)
+                
+                # Обновляем progress bar
+                current_loss = total_loss / total_samples if total_samples > 0 else 0
+                val_bar.set_postfix({'loss': f"{current_loss:.4f}"})
+        
+        avg_loss = total_loss / total_samples if total_samples > 0 else 0
+        print(f"{Fore.GREEN}✅ Валидация завершена{Style.RESET_ALL}")
+        print(f"   Val loss: {avg_loss:.4f}")
+        
+        return avg_loss
+    
+    def train(self):
+        """Основной цикл обучения"""
+        print(f"\n{Fore.CYAN}{'='*70}{Style.RESET_ALL}")
+        print(f"{Fore.MAGENTA}🚀 НАЧАЛО ОБУЧЕНИЯ{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}{'='*70}{Style.RESET_ALL}")
+        
+        # Загружаем данные
+        dialogues = self.load_data()
+        
+        # Подготавливаем компоненты
+        self.prepare_tokenizer()
+        self.prepare_model()
+        self.create_datasets(dialogues)
+        self.create_dataloaders()
+        self.prepare_optimizer()
+        
+        # Параметры обучения
+        training_config = self.config.get('training', {})
+        epochs = training_config.get('epochs', 3)
+        checkpoint_config = self.config.get('checkpoint', {})
+        
+        save_steps = checkpoint_config.get('save_steps', 100)
+        load_best = checkpoint_config.get('load_best_model_at_end', True)
+        patience = checkpoint_config.get('early_stopping', {}).get('patience', 3)
+        
+        # Статистика
+        best_val_loss = float('inf')
+        patience_counter = 0
+        
+        # Главный цикл обучения
+        for epoch in range(1, epochs + 1):
+            self.stats['current_epoch'] = epoch
+            
+            # Тренировка
+            train_loss = self.train_epoch(epoch)
+            
+            # Валидация
+            val_loss = self.validate()
+            
+            # Проверяем лучшую модель
+            is_best = val_loss < best_val_loss
+            if is_best:
+                best_val_loss = val_loss
+                self.stats['best_loss'] = best_val_loss
+                patience_counter = 0
+                print(f"{Fore.GREEN}🎯 Новый лучший результат: {best_val_loss:.4f}{Style.RESET_ALL}")
+                
+                # Сохраняем лучшую модель
+                self.save_checkpoint(
+                    step=epoch * len(self.train_loader),
+                    loss=best_val_loss,
+                    is_best=True
+                )
+            else:
+                patience_counter += 1
+                print(f"{Fore.YELLOW}⚠️  Падение качества, patience: {patience_counter}/{patience}{Style.RESET_ALL}")
+            
+            # Ранняя остановка
+            if patience_counter >= patience:
+                print(f"{Fore.RED}🛑 Ранняя остановка на эпохе {epoch}{Style.RESET_ALL}")
+                break
+            
+            # Регулярное сохранение
+            if epoch % max(1, save_steps // len(self.train_loader)) == 0:
+                self.save_checkpoint(
+                    step=epoch * len(self.train_loader),
+                    loss=val_loss,
+                    is_best=False
+                )
+        
+        # Финальный отчет
+        self.monitor.final_report()
+        
+        # Сохраняем финальную модель если нужно
+        if load_best:
+            print(f"\n{Fore.CYAN}💾 Сохранение финальной модели...{Style.RESET_ALL}")
+            self.save_checkpoint(
+                step=epochs * len(self.train_loader),
+                loss=best_val_loss,
+                is_best=True
+            )
+        
+        print(f"\n{Fore.GREEN}✨ ОБУЧЕНИЕ УСПЕШНО ЗАВЕРШЕНО ✨{Style.RESET_ALL}")
+        
+        return best_val_loss
+
+# ============================================================================
+# ГЛАВНАЯ ФУНКЦИЯ
+# ============================================================================
+
+def main():
+    """Главная функция запуска обучения"""
+    parser = argparse.ArgumentParser(description="Тренер психологического ИИ")
+    parser.add_argument("--config", type=str, default="./configs/base.json", 
+                       help="Путь к конфигурационному файлу")
+    parser.add_argument("--preset", type=str, default=None,
+                       help="Пресет конфигурации (fast, quality, debug)")
+    parser.add_argument("--resume", type=str, default=None,
+                       help="Путь к чекпоинту для возобновления обучения")
+    args = parser.parse_args()
+    
+    try:
+        # Инициализация
+        print(f"{Fore.CYAN}{'='*70}{Style.RESET_ALL}")
+        print(f"{Fore.MAGENTA}{Style.BRIGHT}🧠 RUZANNA - PSYCHOLOGICAL AI TRAINER{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}{'='*70}{Style.RESET_ALL}")
+        
+        # Загрузка конфигурации
+        print(f"{Fore.BLUE}📄 Загрузка конфигурации...{Style.RESET_ALL}")
+        config_manager = ConfigManager("./configs")
+        
+        # Загружаем с учетом пресета
+        config = config_manager.load_full_config(preset=args.preset)
+        
+        # Получаем параметры
+        params = config_manager.get_training_params()
+        
+        print(f"{Fore.GREEN}✅ Конфигурация загружена{Style.RESET_ALL}")
+        print(f"   Модель: {params.get('model_name')}")
+        print(f"   Данные: {Path(params.get('data_path', '')).name}")
+        print(f"   Batch size: {params.get('batch_size')}")
+        print(f"   Эпохи: {params.get('epochs')}")
+        print(f"   Learning rate: {params.get('learning_rate'):.2e}")
+        
+        # Создаем тренер
+        trainer = PsychAITrainer(config)
+        
+        # Запускаем обучение
+        best_loss = trainer.train()
+        
+        print(f"\n{Fore.GREEN}{'='*70}{Style.RESET_ALL}")
+        print(f"{Fore.MAGENTA}🏆 ЛУЧШИЙ РЕЗУЛЬТАТ: {best_loss:.4f}{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}{'='*70}{Style.RESET_ALL}")
+        
+    except KeyboardInterrupt:
+        print(f"\n{Fore.YELLOW}⚠️  Обучение прервано пользователем{Style.RESET_ALL}")
+    except Exception as e:
+        print(f"\n{Fore.RED}❌ Критическая ошибка: {e}{Style.RESET_ALL}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+# ============================================================================
+# ЗАПУСК
+# ============================================================================
+
+if __name__ == "__main__":
+    main()
