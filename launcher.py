@@ -94,39 +94,6 @@ def create_dialogues():
     print(f"  Папка результатов: {output_dir}")
     
     print_step("🔄 Запускаю создание диалогов...")
-
-    # Запускаем процесс
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        universal_newlines=True,
-        bufsize=1,
-        encoding='utf-8'
-        )
-    
-    # Читаем вывод ПОСТРОЧНО
-    print("\n" + "="*60)
-    print("📝 ВЫВОД dialog_loader.py:")
-    print("="*60)
-
-    for line in process.stdout:
-        line = line.rstrip()  # Убираем лишние пробелы
-        if line:  # Выводим только непустые строки
-            print(f"   {line}")
-
-    print("="*60)
-
-    # Ждём завершения
-    process.wait()
-
-    # Пауза чтобы прочитать
-    input("\n👆 Выше вывод скрипта. Нажмите Enter чтобы продолжить...")
-    
-    confirm = input(f"\n{Fore.YELLOW}Создать диалоги? (y/n): {Style.RESET_ALL}").lower()
-    if confirm != 'y':
-        print_info("Создание отменено")
-        return
     
     # 4. Запускаем dialog_loader.py
     print(f"\n{Fore.GREEN}{Style.BRIGHT}🎭 СОЗДАНИЕ ДИАЛОГОВ...{Style.RESET_ALL}")
@@ -176,12 +143,27 @@ def create_dialogues():
             encoding='utf-8'
         )
         
+        print("\n" + "="*60)
+        print("⏳ ОЖИДАНИЕ СОЗДАНИЯ ДИАЛОГОВ...")
+        print("="*60)
+
+        # Читаем вывод в реальном времени
+        output_lines = []
+        for line in process.stdout:
+            line = line.rstrip()
+            if line:
+                print(f"   {line}")
+                output_lines.append(line)
+        
         # Вывод в реальном времени
         for line in process.stdout:
             print(line, end='')
         
         # Ожидание завершения
         process.wait()
+        
+        print("="*60)
+        print(f"✅ Процесс завершился с кодом: {process.returncode}")
         
         if process.returncode == 0:
             print_success(f"\n✅ Создано {num_dialogues:,} диалогов!")
