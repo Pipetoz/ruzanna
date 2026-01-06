@@ -207,7 +207,7 @@ def main():
        output_dir = Path(__file__).parent / "experiments" / "default"
    
     # Создаем папку data внутри
-    data_dir = output_dir / "data"
+    data_dir = Path(output_dir) / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
    
     output_file = data_dir / "dialogues.json"
@@ -327,29 +327,8 @@ def main():
        
        if i % 10 == 0:
            print(f"   Создано {i} диалогов...")
-
-    # ================= СОХРАНЕНИЕ =================
-       
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(output_file, 'w', encoding='utf-8') as f:
-       json.dump(dialogues, f, ensure_ascii=False, indent=2)
-       
-    print(f"Проверка записи в: {output_file}")
-    try:
-        output_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_file, 'w') as test:
-            test.write("test")
-        print("✅ Права записи есть")
-    except Exception as e:
-        print(f"❌ Нет прав записи: {e}")
-
-    print(f"\n✅ СОЗДАНО {len(dialogues)} УЛУЧШЕННЫХ ДИАЛОГОВ")
-    print(f"✅ Файл успешно сохранен!")
-    print(f"📁 Файл: {output_file}")
-    print(f"📊 Размер: {output_file.stat().st_size / 1024:.1f} KB")
-   
-   # Статистика
+    
+    # Статистика
     print(f"\n📊 СТАТИСТИКА:")
     topics_used = set([d['topic'] for d in dialogues])
     print(f"   • Темы: {len(topics_used)} уникальных")
@@ -382,6 +361,27 @@ def main():
     print(sample['text'][:300] + "..." if len(sample['text']) > 300 else sample['text'])
     print(f"{'-'*40}")
    
+    # ================= СОХРАНЕНИЕ =================
+      
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+       
+    print(f"Проверка записи в: {output_file}")
+    try:
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_file, 'w') as test:
+            test.write("test")
+        print("✅ Права записи есть")
+    except Exception as e:
+        print(f"❌ Нет прав записи: {e}")
+
+    with open(output_file, 'w', encoding='utf-8') as f:
+       json.dump(dialogues, f, ensure_ascii=False, indent=2)
+
+    print(f"\n✅ СОЗДАНО {len(dialogues)} УЛУЧШЕННЫХ ДИАЛОГОВ")
+    print(f"✅ Файл успешно сохранен!")
+    print(f"📁 Файл: {output_file}")
+    print(f"📊 Размер: {output_file.stat().st_size / 1024:.1f} KB") 
+    
     return str(output_file)
 
 if __name__ == "__main__":
