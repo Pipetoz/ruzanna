@@ -3,24 +3,24 @@ import time
 import math
 import json
 import torch
-import pynvml
 import bitsandbytes as bnb
 
 from pathlib import Path
 from datetime import datetime
 from transformers import GPTNeoForCausalLM, GPT2Tokenizer, BitsAndBytesConfig
 
+from config import config
 from model_utils import TrainingMode, ValidationMode, GenerationMode
 from monitor_utils import AdvancedTrainingMonitor
 
 MAX_STEP_TIME = 30  # Максимальное время шага в секундах
 
 try:
-    from tqdm import tqdm
-    HAS_TQDM = True
+	from tqdm import tqdm
+	HAS_TQDM = True
 except ImportError:
-    HAS_TQDM = False
-    print("⚠️  tqdm не установлен: pip install tqdm")
+	HAS_TQDM = False
+	print("⚠️  tqdm не установлен: pip install tqdm")
 
 HAS_PYNVML = False
 try:
@@ -230,9 +230,7 @@ def monitor_scaler_state(step, scaler, prefix=""):
 	
 	return True
 
-# Использование в основном цикле:
-if global_step % 50 == 0 and USE_AMP:
-	monitor_scaler_state(global_step, GRAD_SCALER, "   🎛️ ")
+
 
 def handle_nan_loss(loss_value, step_info):
 	"""
@@ -396,26 +394,72 @@ def load_last_checkpoint(checkpoint_dir, model, optimizer=None):
 	return 0, float('inf'), 0
 
 # ================= ПУТИ =================
-try:
-	with open('paths.json', 'r') as pa:
-		base_paths = json.load(pa)
-except Exception as e:
-	print(f"❌ Ошибка загрузки paths.json: {e}")
-	sys.exit(1)
 
-BASE_DIR = Path(base_paths.get('base_dir'))
-CHECKPOINTS_DIR = base_paths.get('checks_dir')
-FINAL_MODEL_DIR = base_paths.get('final_model_dir')
-LOGS_DIR = base_paths.get('logs_dir')
-DATA_DIR = base_paths.get('data_dir')
+CHECKPOINTS_DIR = Path(config['checks_dir'])
+FINAL_MODEL_DIR = Path(config['final_model_dir'])
+LOGS_DIR = Path(config['logs_dir'])
+DATA_DIR = Path(config['data_dir'])
 
 CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
 FINAL_MODEL_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# Инициализируем продвинутый мониторинг с выбранным режимом
-monitor = AdvancedTrainingMonitor(LOGS_DIR, tokenizer, debug_mode=DEBUG_MODE)
+# Проверим файл
+csv_file = monitor.log_dir / "training_log.csv"
+print(f"   • CSV файл создан: {csv_file.exists()}")
+if csv_file.exists():
+	print(f"   • Размер файла: {csv_file.stat().st_size} байт")
+	with open(csv_file, 'r') as f:
+		print(f"   • Содержимое:\n{f.read()}")
+
+# ================= ЗАГРУЗКА ДАННЫХ =================
+print("\n 📂 Загрузка диалогов...")
+
+data_file = Path(config['dataset_file'])
+if data_file.exists():
+	with open(data_file, 'r', encoding='utf-8') as f:
+		dialogues = json.load(f)
+	
+	print(f"✅ Загружено {len(dialogues)} диалогов")
+	
+	texts = [dialogue['text'] for dialogue in dialogues]
+	
+else:
+	print(f"❌ Файл не найден: {data_file}")
+	sys.exit(1)
+# ================= ТОКЕНИЗАЦИЯ =================
+print("\n 🔤 Токенизация данных...")
+# --- Шаг 1: Загружаем токенизатор ДО монитора ---
+model_dir = Path(config['source_model_dir'])
+if not model_dir.exists():
+    print(f"❌ Директория модели не найдена: {model_dir}")
+    sys.exit(1)
+
+try:
+    tokenizer = GPT2Tokenizer.from_pretrained(model_dir)
+    tokenizer.pad_token = tokenizer.eos_token
+    print(f"✅ Токенизатор загружен из: {model_dir}")
+except Exception as e:
+    print(f"❌ Ошибка загрузки токенизатора: {e}")
+    sys.exit(1)
+all_tokens = []
+for text in texts:
+	tokens = tokenizer.encode(
+		text,
+		max_length=MAX_LENGTH,
+		truncation=True,
+		padding='max_length',
+		return_tensors='pt'
+	)
+	all_tokens.append(tokens)
+
+# --- Шаг 2: Создаём монитор (теперь tokenizer существует) ---
+monitor = AdvancedTrainingMonitor(
+    LOGS_DIR,
+    tokenizer,
+    debug_mode=DEBUG_MODE
+)
 
 # Только в отладочном режиме показываем проверку
 if DEBUG_MODE >= 2:
@@ -433,51 +477,8 @@ print(f"   • Существует: {monitor.log_dir.exists()}")
 # Тестовая запись через monitor
 monitor.save_to_csv(0, 1.0, 1e-4, 5.0, "TEST", 10.0, 0.5)
 
-# Проверим файл
-csv_file = monitor.log_dir / "training_log.csv"
-print(f"   • CSV файл создан: {csv_file.exists()}")
-if csv_file.exists():
-	print(f"   • Размер файла: {csv_file.stat().st_size} байт")
-	with open(csv_file, 'r') as f:
-		print(f"   • Содержимое:\n{f.read()}")
 
-# ================= ЗАГРУЗКА ДАННЫХ =================
-print("\n 📂 Загрузка диалогов...")
 
-data_file = base_paths.get('dataset_file')
-if data_file.exists():
-	with open(data_file, 'r', encoding='utf-8') as f:
-		dialogues = json.load(f)
-	
-	print(f"✅ Загружено {len(dialogues)} диалогов")
-	
-	texts = [dialogue['text'] for dialogue in dialogues]
-	
-else:
-	print(f"❌ Файл не найден: {data_file}")
-	sys.exit(1)
-
-# ================= ТОКЕНИЗАЦИЯ =================
-print("\n 🔤 Токенизация данных...")
-
-tokenizer = GPT2Tokenizer.from_pretrained(base_paths.get('source_model_dir'))
-if not Path(base_paths.get('source_model_dir')).exists():
-	print(f"❌ Директория модели не найдена: {base_paths.get('source_model_dir')}")
-	sys.exit(1)
-tokenizer.pad_token = tokenizer.eos_token
-
-all_tokens = []
-for text in texts:
-	tokens = tokenizer.encode(
-		text,
-		max_length=MAX_LENGTH,
-		truncation=True,
-		padding='max_length',
-		return_tensors='pt'
-	)
-	all_tokens.append(tokens)
-
-all_tokens = torch.cat(all_tokens, dim=0)
 
 # Создаем простой Dataset
 class TensorDataset(torch.utils.data.Dataset):
@@ -509,7 +510,7 @@ print("\n 🧠 Загрузка модели...")
 
 # Без квантования
 model = GPTNeoForCausalLM.from_pretrained(
-	base_paths.get('source_model_dir'),
+	Path(config['source_model_dir']),
 	device_map="auto",
 	torch_dtype=torch.float16 if USE_AMP else torch.float32,  # Загружаем веса сразу в выбранной точности
 )
@@ -530,7 +531,6 @@ optimizer = bnb.optim.AdamW8bit(
 
 # НАЙДИТЕ ЭТУ СТРОКУ (~740) И ИСПРАВЬТЕ:
 total_batches = len(train_data) // BATCH_SIZE
-# total_steps = (total_batches // GRADIENT_ACCUMULATION) * EPOCHS  # ❌ СТАРОЕ
 
 # ⬇️ НОВОЕ:
 if GRADIENT_ACCUMULATION > 0:
@@ -603,10 +603,11 @@ for epoch in range(EPOCHS):
 
 	with TrainingMode(model):
 		if HAS_TQDM and DEBUG_MODE <= 2:
-    		pbar = tqdm(total=total_batches, desc=f"Эпоха {epoch+1}", unit="батч")
+			pbar = tqdm(total=total_batches, desc=f"Эпоха {epoch+1}", unit="батч")
 		for batch_idx in range(0, len(train_data_shuffled), BATCH_SIZE):
 			total_batches = len(train_data_shuffled) // BATCH_SIZE
-
+			if global_step % 50 == 0 and USE_AMP:
+				monitor_scaler_state(global_step, GRAD_SCALER, "   🎛️ ")
 			# 🛡️ ЗАЩИТА SCALER ПЕРЕД НАЧАЛОМ ЭПОХИ
 			if USE_AMP and epoch > 0:  # Проверяем со второй эпохи
 				scaler_ok = check_scaler_health(GRAD_SCALER, f"Эпоха {epoch+1}")
@@ -690,12 +691,12 @@ for epoch in range(EPOCHS):
 						GRAD_SCALER.step(optimizer)
 						try:
 						# Проверка scale перед обновлением
-						current_scale = GRAD_SCALER.get_scale()
-						if current_scale > 1e6 or current_scale < 1e-6:
-							print(f"   ⚠️  Подозрительный scale: {current_scale:.2e}, сбрасываем")
-							GRAD_SCALER = torch.cuda.amp.GradScaler(enabled=True)
-					except:
-						pass
+							current_scale = GRAD_SCALER.get_scale()
+							if current_scale > 1e6 or current_scale < 1e-6:
+								print(f"   ⚠️  Подозрительный scale: {current_scale:.2e}, сбрасываем")
+								GRAD_SCALER = torch.cuda.amp.GradScaler(enabled=True)
+						except:
+							pass
 						GRAD_SCALER.update()  # Обновляем масштаб для следующей итерации
 					else:
 						grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -707,7 +708,7 @@ for epoch in range(EPOCHS):
 					global_step += 1
 
 					if HAS_TQDM and DEBUG_MODE <= 2:
-        				pbar.update(1)
+						pbar.update(1)
 				# ================= ВЫВОД ПРОГРЕССА =================
 				current_lr = LEARNING_RATE  # начальное значение
 
@@ -764,7 +765,6 @@ for epoch in range(EPOCHS):
 				
 				# Gradient accumulation
 				loss = loss / GRADIENT_ACCUMULATION
-				loss.backward()
 				
 				accumulation_count += 1
 				
