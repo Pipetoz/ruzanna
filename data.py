@@ -40,31 +40,13 @@ if ma: print(ts(st, "pathlib"))
 import yaml
 if ma: print(ts(st, "yaml"))
 
-from config import clear_screen, config, error, header, info, progress_bar, success, title, warning
+from config import clear_screen, config, error, header, info, progress_bar, success, title, warning, rulables
 if ma: print(ts(st, "config"))
 
 import pandas as pd
 if ma: print(ts(st, "pandas"))
 
 if ma: print("\n" + ts(tot, "Общее время импортов") + "\n")
-
-
-def rulables():
-	try:
-		with open(Path(config['dataset_dir']) / "dataset" / "label_to_russian_label.yaml", 'r', encoding='utf-8') as f:
-			rulables = yaml.safe_load(f)
-		if not isinstance(rulables, dict):
-			raise ValueError("Загруженные данные не являются словарем.")
-	except FileNotFoundError:
-		error("Файл 'label_to_russian_label.yaml' не найден. Проверьте путь к файлу.")
-		rulables = {}  # Или можно завершить выполнение или задать значение по умолчанию
-	except yaml.YAMLError as e:
-		error(f"Ошибка при парсинге YAML: {e}")
-		rulables = {}
-	except ValueError as e:
-		warning(f"Некорректный формат данных: {e}")
-		rulables = {}
-	return rulables
 
 
 def load_data(data_dir: str, split: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -354,6 +336,7 @@ def data_start():
 		progress_bar(3, f"✓  Загрузка данных")
 
 		train_df, val_df, test_df = load_data(dataset_dir, split)
+
 		texts = []
 		labels = []
 		ids = []
@@ -459,6 +442,21 @@ def data_start():
 		label2id = {name: idx for idx, name in enumerate(rulables().keys())}
 		if not validate_processed_data(processed_data, label2id):
 			return
+		id2label = {idx: name for name, idx in label2id.items()}
+		info("Загрузка токенизатора")
+		from transformers import AutoTokenizer
+		tokenizer = AutoTokenizer.from_pretrained(config['source_model_dir'])
+
+		# Получаем только сплиты с данными
+		data_splits_only = {k: v for k, v in processed_data.items()
+							if isinstance(v, dict) and "texts" in v}
+
+		# Обновляем processed_data
+		processed_data.update({
+			"vectorizer": tokenizer,
+			"label2id": label2id,
+			"id2label": id2label
+		})
 
 		# Сохранение метаданных и данных
 		meta_data = {
@@ -466,11 +464,15 @@ def data_start():
 			"label2id": label2id,
 			"splits": {
 				split_name: {"size": len(split["texts"])}
-				for split_name, split in processed_data.items()
+				for split_name, split in data_splits_only.items()
 			},
 			"split_type": split,
-			"total_examples": sum(len(split["texts"]) for split in processed_data.values())
+			"total_examples": sum(len(split["texts"]) for split in data_splits_only.values())
 		}
+
+		print(f"Уникальные метки в данных: {set([l for sublist in labels_filtered for l in sublist])}\n")
+		print(f"Максимальная метка: {max([l for sublist in labels_filtered for l in sublist])}\n")
+		print(f"Количество классов: {len(rulables().keys())}\n")
 
 		progress_bar(3, "ℹ  Сохранение результатов")
 		save_metadata(meta_data, output_path)
