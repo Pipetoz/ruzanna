@@ -92,18 +92,17 @@ OUTPUT_DIR = config['final_model_dir']
 # Функция для подавления вывода
 def suppress_output(func):
 	def wrapper(*args, **kwargs):
-		# Для Windows
-		if os.name == 'nt':
-			with open('NUL', 'w') as f:
-				old_stdout = sys.stdout
-				old_stderr = sys.stderr
-				sys.stdout = f
-				sys.stderr = f
-				try:
-					return func(*args, **kwargs)
-				finally:
-					sys.stdout = old_stdout
-					sys.stderr = old_stderr
+		null_device = os.devnull  # Автоматически выберет 'NUL' или '/dev/null'
+		with open(null_device, 'w') as f:
+			old_stdout = sys.stdout
+			old_stderr = sys.stderr
+			sys.stdout = f
+			sys.stderr = f
+			try:
+				return func(*args, **kwargs)
+			finally:
+				sys.stdout = old_stdout
+				sys.stderr = old_stderr
 	return wrapper
 
 @suppress_output
@@ -136,7 +135,7 @@ class EmotionsDataset(Dataset):
 
 		return {
 			'input_ids': encoding['input_ids'][0],
-			'attention_mask': encoding['attention_mask'],
+			'attention_mask': encoding['attention_mask'][0],
 			'labels': torch.tensor(label, dtype=torch.float)
 		}
 
@@ -335,6 +334,7 @@ def train():
 					val_loss += outputs.loss.item()
 
 				preds = torch.argmax(outputs.logits, dim=1)
+				true_labels = torch.argmax(labels, dim=1)
 				correct += (preds == labels).sum().item()
 				total += labels.size(0)
 
