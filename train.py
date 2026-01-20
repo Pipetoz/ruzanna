@@ -77,7 +77,7 @@ if ma: print("\n" + ts(tot, "Общее время импортов") + "\n")
 
 def training_menu():
 	"""Меню выбора режима обучения"""
-	clear_screen()
+	#clear_screen()
 	title("РЕЖИМ ОБУЧЕНИЯ МОДЕЛИ")
 
 	print(f"{Style.BRIGHT}1.{Style.RESET_ALL} Полное обучение ({EPOCHS} эпох, все данные)")
@@ -121,20 +121,27 @@ def training_menu():
 		else:
 			error("Неверный выбор. Введите 1, 2, 3 или 4.")
 
-
-EPOCHS = config['epochs']
-MODEL_NAME = config['source_model_dir']
-MAX_LEN = config['max_len']
-BATCH_SIZE = config['batch_size']
-ACCUMULATION_STEPS = config['accumulation_steps']
-LEARNING_RATE = config['learning_rate']
-WARMUP_STEPS = config['warmup_steps']
-WEIGHT_DECAY = config['weight_decay']
-FP32 = config['fp32']
-USE_TRITON = config['use_triton']
 CHECKPOINTS_DIR = config['checks_dir']
 LOG_DIR = config['logs_dir']
 OUTPUT_DIR = config['final_model_dir']
+MODEL_NAME = config['source_model_dir']
+
+EPOCHS = int(config['epochs'])
+MAX_LEN = int(config['max_len'])
+BATCH_SIZE = int(config['batch_size'])
+ACCUMULATION_STEPS = int(config['accumulation_steps'])
+LEARNING_RATE = float(config['learning_rate'])
+WARMUP_STEPS = int(config['warmup_steps'])
+WEIGHT_DECAY = float(config['weight_decay'])
+FP32 = config['fp32']
+if isinstance(FP32, str):
+	FP32 = FP32.lower() == 'true'
+USE_TRITON = config['use_triton']
+if isinstance(USE_TRITON, str):
+	USE_TRITON = USE_TRITON.lower() == 'true'
+
+
+
 
 # После загрузки констант из config, добавьте проверку:
 print(f"{Fore.CYAN}{Style.BRIGHT}=== КОНФИГУРАЦИЯ ОБУЧЕНИЯ ==={Style.RESET_ALL}")
