@@ -419,8 +419,8 @@ def train(test_mode=False, test_sample_size=100):
 		weight_decay=WEIGHT_DECAY,
 		learning_rate=LEARNING_RATE,
 		logging_dir=str(LOG_DIR),
-		logging_steps=test_logging_steps,
-		evaluation_strategy="epoch",
+		logging_strategy=test_logging_steps,
+		eval_strategy="epoch",
 		save_strategy="epoch" if not test_mode else "no",
 		save_total_limit=2,
 		load_best_model_at_end=not test_mode,
@@ -501,10 +501,10 @@ def train(test_mode=False, test_sample_size=100):
 
 	return eval_metrics
 
-if __name__ == "__main__":
+def start_train():
 	try:
 		# Показать заголовок
-		clear_screen()
+		#clear_screen()
 		header("ОБУЧЕНИЕ МОДЕЛИ КЛАССИФИКАЦИИ ЭМОЦИЙ")
 
 		# Проверить наличие данных
@@ -534,7 +534,10 @@ if __name__ == "__main__":
 		error("\nОбучение прервано пользователем")
 		sys.exit(1)
 	except Exception as e:
-		error(f"\nКритическая ошибка: {e}")
+		error(f"Критическая ошибка: {e}")
 		import traceback
 		traceback.print_exc()
 		sys.exit(1)
+
+if __name__ == "__main__":
+	start_train()
