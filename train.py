@@ -55,9 +55,6 @@ if ma: print(ts(st, "torch"))
 import torch.nn as nn
 if ma: print(ts(st, "torch.nn"))
 
-import ast
-if ma: print(ts(st, "ast"))
-
 from sklearn.preprocessing import MultiLabelBinarizer
 if ma: print(ts(st, "sklearn"))
 
@@ -210,63 +207,6 @@ class MultiLabelEmotionsDataset(Dataset):
 		assert train_labels[0].dtype == np.int64 or train_labels[0].dtype == np.float64, f"Неверный тип меток: {train_labels[0].dtype}"
 		print(f"✅ Метки преобразованы в one-hot формат: {train_labels.shape[1]} классов")
 
-# ========== ФУНКЦИИ ДЛЯ ВЫЧИСЛЕНИЯ МЕТРИК ==========
-def multi_label_metrics(predictions, labels, threshold=0.5):
-	"""
-	Вычисление метрик для многометочной классификации.
-
-	Args:
-		predictions: логиты модели (numpy array)
-		labels: истинные метки (numpy array)
-		threshold: порог для бинаризации предсказаний
-
-	Returns:
-		dict: словарь с метриками
-	"""
-	# Преобразуем логиты в вероятности с помощью сигмоиды
-	sigmoid = torch.nn.Sigmoid()
-	probs = sigmoid(torch.tensor(predictions))
-
-	# Бинаризируем предсказания по порогу
-	preds = (probs > threshold).float()
-
-	# Преобразуем labels в тензор
-	labels_tensor = torch.tensor(labels)
-
-	# Вычисляем accuracy (доля правильных предсказаний по всем меткам)
-	correct = (preds == labels_tensor).sum().item()
-	total = labels_tensor.numel()
-	accuracy = correct / total
-
-	# Вычисляем precision, recall, f1 для каждого класса (macro averaging)
-	from sklearn.metrics import precision_score, recall_score, f1_score
-	# Нужно преобразовать в формат для sklearn (убираем batch dimension)
-	preds_np = preds.numpy()
-	labels_np = labels
-
-	# Для многометочной классификации используем 'samples' или 'micro'
-	try:
-		precision = precision_score(labels_np, preds_np, average='micro', zero_division=0)
-		recall = recall_score(labels_np, preds_np, average='micro', zero_division=0)
-		f1 = f1_score(labels_np, preds_np, average='micro', zero_division=0)
-	except:
-		precision = recall = f1 = 0.0
-
-	return {
-		"accuracy": accuracy,
-		"precision": precision,
-		"recall": recall,
-		"f1": f1
-	}
-
-def compute_metrics(eval_pred):
-	"""
-	Функция для Hugging Face Trainer.
-	Преобразует вывод модели в метрики.
-	"""
-	logits, labels = eval_pred
-	return multi_label_metrics(logits, labels)
-
 # ========== ГЛАВНАЯ ФУНКЦИЯ ОБУЧЕНИЯ ==========
 def train(test_mode=False, test_sample_size=100):
 	"""
@@ -286,7 +226,7 @@ def train(test_mode=False, test_sample_size=100):
 	if test_mode:
 		# В тестовом режиме меняем некоторые параметры
 		test_epochs = 1
-		test_batch_size = min(2, BATCH_SIZE)
+		test_batch_size = BATCH_SIZE
 		test_logging_steps = 5
 		info(f"ТЕСТОВЫЙ РЕЖИМ: {test_epochs} эпоха, ~{test_sample_size} примеров")
 	else:
@@ -408,6 +348,8 @@ def train(test_mode=False, test_sample_size=100):
 			attention_probs_dropout_prob=0.1
 		)
 		success(f"✓ Модель загружена (многометочная классификация)")
+		model.gradient_checkpointing_enable()
+		success("Gradient Checkpointing включён")
 	finally:
 		transformers_logging.set_verbosity(old_verbosity)
 		warnings.resetwarnings()
@@ -445,7 +387,7 @@ def train(test_mode=False, test_sample_size=100):
 	)
 	val_loader = DataLoader(
 		val_dataset,
-		batch_size=test_batch_size * 2,
+		batch_size=test_batch_size,
 		shuffle=False,
 		num_workers=0,
 		pin_memory=True if device.type == "cuda" else False
@@ -480,7 +422,7 @@ def train(test_mode=False, test_sample_size=100):
 
 	# Постоянный scheduler с прогревом - ПРОЩЕ И СТАБИЛЬНЕЕ
 	total_steps = len(train_loader) // ACCUMULATION_STEPS * test_epochs
-	warmup_steps = 500  # Фиксированные 500 шагов на прогрев
+	warmup_steps = 50  # Фиксированные 500 шагов на прогрев
 	info(f"Общее шагов: {total_steps}, Прогрев: {warmup_steps} шагов")
 
 	scheduler = get_constant_schedule_with_warmup(
@@ -495,30 +437,13 @@ def train(test_mode=False, test_sample_size=100):
 	# TensorBoard
 	writer = SummaryWriter(LOG_DIR)
 
-	# ========== ФУНКЦИЯ ПРЕОБРАЗОВАНИЯ МЕТОК ==========
-	def prepare_targets(label_indices_batch, num_classes=num_classes, device=device):
-		"""
-		Преобразует батч списков индексов [[0,5], [2], ...] в one-hot тензор.
-		"""
-		if isinstance(label_indices_batch, torch.Tensor):
-			# Уже one-hot тензор
-			return label_indices_batch.to(device)
-
-		batch_size = len(label_indices_batch)
-		targets = torch.zeros(batch_size, num_classes, device=device, dtype=torch.float)
-
-		for i, indices in enumerate(label_indices_batch):
-			if isinstance(indices, (list, np.ndarray)) and len(indices) > 0:
-				targets[i, indices] = 1.0
-
-		return targets
-
 	# ========== КАСТОМНЫЙ ЦИКЛ ОБУЧЕНИЯ ==========
 	info(f"Старт обучения на {test_epochs} эпох...")
 	global_step = 0
 	best_f1 = 0.0
 
 	for epoch in range(test_epochs):
+
 		# Динамический порог классификации
 		threshold = 0.3  # Начинаем с более низкого порога
 		if epoch > 0 and f1 < 0.1:  # Если на предыдущей эпохе F1 был очень низким
@@ -593,6 +518,39 @@ def train(test_mode=False, test_sample_size=100):
 		avg_train_loss = total_train_loss / len(train_loader)
 		info(f"Эпоха {epoch+1}: Средняя тренировочная loss = {avg_train_loss:.4f}")
 
+		# ДИАГНОСТИКА КАЖДЫЕ 100 ШАГОВ
+		if step % 100 == 0:
+			with torch.no_grad():
+				probs = torch.sigmoid(outputs.logits)
+
+				# 1. Статистика предсказаний
+				avg_prob = probs.mean().item()
+				min_prob = probs.min().item()
+				max_prob = probs.max().item()
+
+				# 2. Статистика меток
+				avg_label = labels.mean().item()  # Какая доля меток = 1?
+				positive_labels = (labels == 1).sum().item()
+				total_labels = labels.numel()
+
+				# 3. Проверка одного примера
+				if step == 0:
+					print(f"\n{Fore.YELLOW}ПЕРВЫЙ БАТЧ:{Style.RESET_ALL}")
+					print(f"Метки (первые 5 классов в первом примере): {labels[0, :5].cpu().numpy()}")
+					print(f"Предсказания (первые 5 классов): {probs[0, :5].cpu().numpy()}")
+
+			print(f"Шаг {step}: loss={loss.item() * ACCUMULATION_STEPS:.6f}, avg_prob={avg_prob:.4f}, "
+				  f"активные метки={positive_labels}/{total_labels} ({avg_label*100:.1f}%)")
+
+			# КРИТИЧЕСКИЕ ПРОВЕРКИ
+			if avg_prob < 0.01 or avg_prob > 0.99:
+				error(f"Вероятности экстремальны! avg_prob={avg_prob:.4f}")
+				warning("Проверь: 1) Инициализацию модели 2) Данные 3) Функцию потерь")
+
+			if avg_label < 0.01:
+				warning(f"Очень мало активных меток: {avg_label*100:.1f}%")
+				warning("Возможно, метки состоят почти из нулей (класс 'нейтральный' доминирует)")
+
 		# ------ ФАЗА ВАЛИДАЦИИ ------
 		model.eval()
 		total_val_loss = 0
@@ -600,6 +558,13 @@ def train(test_mode=False, test_sample_size=100):
 		all_labels = []
 
 		with torch.no_grad():
+			# Сравниваем loss от модели и ручной расчет
+			loss_fn_manual = nn.BCEWithLogitsLoss()
+			manual_loss = loss_fn_manual(outputs.logits, labels)
+			model_loss = outputs.loss
+
+			if abs(model_loss.item() - manual_loss.item()) > 0.001:
+				warning(f"Расхождение в loss: model={model_loss.item():.6f}, manual={manual_loss.item():.6f}")
 			val_progress = tqdm(val_loader, desc=f"Эпоха {epoch+1}/{test_epochs} [Валидация]")
 			for batch in val_progress:
 				input_ids = batch['input_ids'].to(device)
@@ -622,6 +587,7 @@ def train(test_mode=False, test_sample_size=100):
 				all_preds.append(probs.cpu())
 				all_labels.append(labels.cpu())
 
+
 		# Вычисление метрик
 		avg_val_loss = total_val_loss / len(val_loader)
 		all_preds = torch.cat(all_preds)
@@ -643,18 +609,19 @@ def train(test_mode=False, test_sample_size=100):
 		writer.add_scalar("val/f1", f1, epoch)
 
 		# ------ СОХРАНЕНИЕ ЛУЧШЕЙ МОДЕЛИ ------
-		if not test_mode and f1 > best_f1:
+		if f1 > best_f1:
 			best_f1 = f1
 			model.save_pretrained(OUTPUT_DIR)
 			tokenizer.save_pretrained(OUTPUT_DIR)
 			success(f"Модель сохранена (новый лучший F1: {f1:.4f})!")
 
 		# Сохранение чекпоинта
-		if not test_mode and CHECKPOINTS_DIR:
+		if CHECKPOINTS_DIR:
 			checkpoint_dir = Path(CHECKPOINTS_DIR) / f"epoch_{epoch+1}"
 			checkpoint_dir.mkdir(parents=True, exist_ok=True)
 			model.save_pretrained(checkpoint_dir)
 			tokenizer.save_pretrained(checkpoint_dir)
+		torch.cuda.empty_cache()
 
 	# ========== ФИНАЛИЗАЦИЯ ==========
 	writer.close()
