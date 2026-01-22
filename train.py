@@ -218,6 +218,8 @@ def train(test_mode=False, test_sample_size=100):
 		test_sample_size (int): Количество примеров для теста
 	"""
 
+	global USE_TRITON
+
 	# ========== НАСТРОЙКА ПАРАМЕТРОВ ==========
 	print(f"{Fore.CYAN}{Style.BRIGHT}=== {'ТЕСТОВЫЙ РЕЖИМ' if test_mode else 'ОБУЧЕНИЕ'} ==={Style.RESET_ALL}")
 
@@ -251,8 +253,15 @@ def train(test_mode=False, test_sample_size=100):
 	data_path = Path(config['data_dir']) / "ru_goemotions_metadata.pkl"
 	info(f"Загрузка данных из: {data_path}")
 
-	with open(data_path, "rb") as f:
-		processed_data = pickle.load(f)
+	try:
+		with open(data_path, "rb") as f:
+			processed_data = pickle.load(f)
+	except FileNotFoundError:
+		error(f"Файл данных не найден: {data_path}")
+		sys.exit(1)
+	except pickle.PickleError as e:
+		error(f"Ошибка загрузки pickle-файла: {e}")
+		sys.exit(1)
 
 	info(f"Ключи в данных: {list(processed_data.keys())}")
 
@@ -303,6 +312,10 @@ def train(test_mode=False, test_sample_size=100):
 		val_texts = val_texts[:val_size]
 		val_labels = val_labels[:val_size]
 
+		if len(train_texts) == 0:
+			error("После ограничения данных обучающая выборка пуста. Проверьте test_sample_size.")
+			sys.exit(1)
+
 	# Получаем количество классов
 	num_classes = len(processed_data["label2id"])
 	success(f"Количество классов (эмоций): {num_classes}")
@@ -347,9 +360,16 @@ def train(test_mode=False, test_sample_size=100):
 			hidden_dropout_prob=0.1,
 			attention_probs_dropout_prob=0.1
 		)
+
 		success(f"✓ Модель загружена (многометочная классификация)")
 		model.gradient_checkpointing_enable()
 		success("Gradient Checkpointing включён")
+	except OSError as e:
+		error(f"Ошибка загрузки модели {MODEL_NAME}: {e}")
+		sys.exit(1)
+	except Exception as e:
+		error(f"Неожиданная ошибка при загрузке модели: {e}")
+		sys.exit(1)
 	finally:
 		transformers_logging.set_verbosity(old_verbosity)
 		warnings.resetwarnings()
@@ -364,6 +384,9 @@ def train(test_mode=False, test_sample_size=100):
 		torch.set_float32_matmul_precision('high')
 		model = compile_model(model)
 		success("✓ Triton включён (inductor + default)")
+	elif USE_TRITON and not torch.cuda.is_available():
+		warning("Triton включён, но CUDA не доступен. Пропускаем компиляцию.")
+		USE_TRITON = False
 
 	# ========== НАСТРОЙКА ОБУЧЕНИЯ ==========
 	info("Настройка обучения...")
@@ -383,14 +406,16 @@ def train(test_mode=False, test_sample_size=100):
 		batch_size=test_batch_size,
 		shuffle=True,
 		num_workers=0,
-		pin_memory=True if device.type == "cuda" else False
+		pin_memory=False if device.type == "cuda" else True,
+		persistent_workers = False
 	)
 	val_loader = DataLoader(
 		val_dataset,
 		batch_size=test_batch_size,
 		shuffle=False,
 		num_workers=0,
-		pin_memory=True if device.type == "cuda" else False
+		pin_memory=False if device.type == "cuda" else True,
+		persistent_workers = False
 	)
 
 	# ========== ПОДГОТОВКА ОПТИМИЗАТОРА И SCHEDULER ==========
@@ -464,16 +489,47 @@ def train(test_mode=False, test_sample_size=100):
 
 			# Forward pass с mixed precision
 			with autocast(device_type=device.type, enabled=not FP32):
-				outputs = model(
-					input_ids=input_ids,
-					attention_mask=attention_mask,
-					labels=labels
-				)
+				try:
+					outputs = model(
+						input_ids=input_ids,
+						attention_mask=attention_mask,
+						labels=labels
+					)
+				except RuntimeError as e:
+					if "out of memory" in str(e):
+						error("Недостаточно VRAM. Попробуйте уменьшить batch_size или max_len.")
+						sys.exit(1)
+					else:
+						raise e
 				loss = outputs.loss
 				loss = loss / ACCUMULATION_STEPS
 
 			# Backward pass
 			scaler.scale(loss).backward()
+
+			# --- ПРОВЕРКА NaN/Inf ---
+			has_problem = False
+			problem_params = []
+
+			for name, param in model.named_parameters():
+				if param.grad is not None:
+					has_nan = torch.isnan(param.grad).any().item()
+					has_inf = torch.isinf(param.grad).any().item()
+
+					if has_nan or has_inf:
+						problem_params.append(name)
+						if has_nan:
+							error(f"NaN в градиентах: {name}")
+						if has_inf:
+							error(f"Inf в градиентах: {name}")
+						has_problem = True
+
+			if has_problem:
+				error(f"Прерывание: некорректные градиенты в {len(problem_params)} параметрах")
+				sys.exit(1)
+
+			# --- КОНЕЦ ПРОВЕРКИ ---
+
 
 			if (step + 1) % ACCUMULATION_STEPS == 0 or (step + 1) == len(train_loader):
 				scaler.unscale_(optimizer)
@@ -621,6 +677,7 @@ def train(test_mode=False, test_sample_size=100):
 			checkpoint_dir.mkdir(parents=True, exist_ok=True)
 			model.save_pretrained(checkpoint_dir)
 			tokenizer.save_pretrained(checkpoint_dir)
+
 		torch.cuda.empty_cache()
 
 	# ========== ФИНАЛИЗАЦИЯ ==========
